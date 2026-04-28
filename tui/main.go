@@ -8,7 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/philosopher/comp-neuroscientist/tui/ui"
 )
@@ -35,11 +35,8 @@ func main() {
 	model := ui.NewModel(pythonPath, agentModule)
 
 	// Start the Bubble Tea program
-	p := tea.NewProgram(
-		model,
-		tea.WithAltScreen(),       // alternate screen buffer
-		tea.WithMouseCellMotion(), // mouse support
-	)
+	// AltScreen and mouse mode are declared in Model.View()
+	p := tea.NewProgram(model)
 
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error running TUI: %v\n", err)

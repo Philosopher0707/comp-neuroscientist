@@ -3,7 +3,7 @@
 package ui
 
 import (
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 )
 
 // ── Color palette (Tokyo Night inspired) ──────────────────────────

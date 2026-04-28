@@ -10,12 +10,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/help"
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/help"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/philosopher/comp-neuroscientist/tui/agent"
 	"github.com/philosopher/comp-neuroscientist/tui/protocol"
@@ -76,7 +76,7 @@ func NewModel(pythonPath, agentModule string) *Model {
 	ti.Placeholder = "Describe your neuroscience analysis..."
 	ti.Focus()
 	ti.CharLimit = 1000
-	ti.Width = 60
+	ti.SetWidth(60)
 	ti.Prompt = "┃ "
 
 	// Start the agent runner (not running yet)
@@ -164,19 +164,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.help.Width = msg.Width
-		m.viewport.Width = m.contentWidth()
-		m.viewport.Height = m.contentHeight()
-		m.input.Width = m.contentWidth() - 6
-			if m.viewport.View() == "" {
-				m.viewport.SetContent("Ready. Describe your neuroscience analysis task below.\n\nExamples:\n  · \"Load BOLD data and compute functional connectivity\"\n  · \"Run spike sorting on neuropixels recording\"\n  · \"EEG time-frequency analysis on face vs house\"\n  · \"Simulate LIF network with STDP\"\n  · \"Permutation test with cluster correction\"")
-			}
+		m.help.SetWidth(msg.Width)
+		m.viewport.SetWidth(m.contentWidth())
+		m.viewport.SetHeight(m.contentHeight())
+		m.input.SetWidth(m.contentWidth() - 6)
+		if m.viewport.GetContent() == "" {
+			m.viewport.SetContent("Ready. Describe your neuroscience analysis task below.\n\nExamples:\n  · \"Load BOLD data and compute functional connectivity\"\n  · \"Run spike sorting on neuropixels recording\"\n  · \"EEG time-frequency analysis on face vs house\"\n  · \"Simulate LIF network with STDP\"\n  · \"Permutation test with cluster correction\"")
+		}
 
 	// ── Key events ──────────────────────────────────
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		// Enter always submits if there's text and agent is idle — regardless of focus
-		if msg.Type == tea.KeyEnter && m.input.Value() != "" && !m.agentActive {
+		if msg.String() == "enter" && m.input.Value() != "" && !m.agentActive {
 			prompt := m.input.Value()
 			m.input.SetValue("")
 			m.agentStatus = "running"
@@ -192,8 +192,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				displayText += fmt.Sprintf("\n%s\n\n", strings.Repeat("─", min(m.contentWidth(), 20)))
 			}
 			displayText += sanitizePaths(RenderMarkdown(m.streamingOutput), m.homeDir)
-			m.viewport.Width = m.contentWidth()
-			m.viewport.Height = m.contentHeight()
+			m.viewport.SetWidth(m.contentWidth())
+			m.viewport.SetHeight(m.contentHeight())
 			m.viewport.SetContent(displayText)
 			m.viewport.GotoBottom()
 
@@ -389,28 +389,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// ── Update viewport ────────────────────────────
-	var vpCmd tea.Cmd
-	if _, isKey := msg.(tea.KeyMsg); isKey {
-		if m.focus == "main" {
+	// Skip WindowSizeMsg — we handle dimensions manually in the case above
+	// to prevent the viewport's internal resize handler from duplicating content.
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		// handled above
+	default:
+		var vpCmd tea.Cmd
+		if _, isKey := msg.(tea.KeyMsg); isKey {
+			if m.focus == "main" {
+				m.viewport, vpCmd = m.viewport.Update(msg)
+			}
+		} else {
 			m.viewport, vpCmd = m.viewport.Update(msg)
 		}
-	} else {
-		m.viewport, vpCmd = m.viewport.Update(msg)
+		cmds = append(cmds, vpCmd)
 	}
-	cmds = append(cmds, vpCmd)
 
 	return m, tea.Batch(cmds...)
 }
 
 // ── View ─────────────────────────────────────────────────────
 
-func (m Model) View() string {
+func (m Model) View() tea.View {
 	if m.quitting {
-		return "\n  Goodbye!\n\n"
+		return tea.NewView("\n  Goodbye!\n\n")
 	}
 
 	if m.showHelp {
-		return m.helpView()
+		return tea.NewView(m.helpView())
 	}
 
 	// ── Layout ─────────────────────────────────────────
@@ -446,11 +453,14 @@ func (m Model) View() string {
 			statusBar,
 		))
 
-	return lipgloss.JoinHorizontal(
+	v := tea.NewView(lipgloss.JoinHorizontal(
 		lipgloss.Top,
 		sidebarRendered,
 		mainRendered,
-	)
+	))
+	v.AltScreen = true
+	v.MouseMode = tea.MouseModeCellMotion
+	return v
 }
 
 // ── Sidebar ─────────────────────────────────────────────────

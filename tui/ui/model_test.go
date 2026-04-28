@@ -3,7 +3,7 @@ package ui
 import (
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	"github.com/philosopher/comp-neuroscientist/tui/protocol"
 )
 
@@ -19,14 +19,14 @@ func TestTypingAfterResponse(t *testing.T) {
 
 	// Simulate typing "hello" and pressing Enter
 	for _, r := range "hello" {
-		m = toModel(m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}))
+		m = toModel(m.Update(tea.KeyPressMsg{Code: r, Text: string(r)}))
 	}
 	if m.input.Value() != "hello" {
 		t.Fatalf("expected input value 'hello', got %q", m.input.Value())
 	}
 
 	// Submit
-	m = toModel(m.Update(tea.KeyMsg{Type: tea.KeyEnter}))
+	m = toModel(m.Update(tea.KeyPressMsg{Code: tea.KeyEnter, Text: "enter"}))
 	if !m.agentActive {
 		t.Fatal("expected agent to be active after Enter")
 	}
@@ -43,7 +43,7 @@ func TestTypingAfterResponse(t *testing.T) {
 
 	// Try typing again
 	for _, r := range "test" {
-		m = toModel(m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}))
+		m = toModel(m.Update(tea.KeyPressMsg{Code: r, Text: string(r)}))
 	}
 	if m.input.Value() != "test" {
 		t.Fatalf("expected input value 'test' after second response, got %q", m.input.Value())
