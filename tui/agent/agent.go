@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 
 	"github.com/philosopher/comp-neuroscientist/tui/protocol"
@@ -16,14 +17,13 @@ import (
 
 // Runner manages the Python agent subprocess lifecycle and event streaming.
 type Runner struct {
-	events    chan *protocol.Event
-	done      chan struct{}
-	mu        sync.Mutex
-	running   bool
-	python    string // path to python3 binary
-	agentPkg  string // Python module path, e.g. "comp_neuroscientist.cli"
-	cwd       string // working directory for subprocess
-	cancel    context.CancelFunc // cancels the subprocess context
+	events   chan *protocol.Event
+	done     chan struct{}
+	mu       sync.Mutex
+	running  bool
+	python   string // path to python3 binary
+	agentPkg string // Python module path, e.g. "comp_neuroscientist.cli"
+	cancel   context.CancelFunc
 }
 
 // NewRunner creates a Runner that will launch the Python agent.
@@ -31,10 +31,10 @@ type Runner struct {
 // agentModule: Python module to run (e.g., "comp_neuroscientist.cli")
 func NewRunner(pythonPath, agentModule string) *Runner {
 	return &Runner{
-		events:    make(chan *protocol.Event, 256),
-		done:      make(chan struct{}),
-		python:    pythonPath,
-		agentPkg:  agentModule,
+		events:   make(chan *protocol.Event, 4096),
+		done:     make(chan struct{}),
+		python:   pythonPath,
+		agentPkg: agentModule,
 	}
 }
 
@@ -65,7 +65,7 @@ func (r *Runner) Start(prompt, modelName string, localMode bool) error {
 		return fmt.Errorf("agent already running")
 	}
 	// Create fresh channels for this run (previous run's channels are closed)
-	r.events = make(chan *protocol.Event, 256)
+	r.events = make(chan *protocol.Event, 4096)
 	r.done = make(chan struct{})
 	r.running = true
 	r.mu.Unlock()
@@ -96,14 +96,21 @@ func (r *Runner) Start(prompt, modelName string, localMode bool) error {
 		return fmt.Errorf("stdout pipe: %w", err)
 	}
 
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		cancel()
+		return fmt.Errorf("stderr pipe: %w", err)
+	}
+
 	if err := cmd.Start(); err != nil {
 		cancel()
 		return fmt.Errorf("start agent: %w", err)
 	}
 
-	// Stream events in background
-	go r.streamEvents(stdout)
-	go r.waitExit(cmd)
+	// Stream events + wait for exit in a single goroutine.
+	// This eliminates the race between streamEvents and waitExit
+	// closing the events channel (the old waitExit could panic on send-after-close).
+	go r.streamAndWait(cmd, stdout, stderr)
 
 	return nil
 }
@@ -111,25 +118,42 @@ func (r *Runner) Start(prompt, modelName string, localMode bool) error {
 // Stop sends an interrupt signal to the agent process via context cancellation.
 func (r *Runner) Stop() error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if !r.running || r.cancel == nil {
+		r.mu.Unlock()
 		return nil
 	}
+	r.mu.Unlock()
+
 	r.cancel()
 	return nil
 }
 
-func (r *Runner) streamEvents(stdout io.ReadCloser) {
+// streamAndWait reads JSON events from stdout, captures stderr, then waits
+// for the process to exit. Owns both channel closes (events + done).
+func (r *Runner) streamAndWait(cmd *exec.Cmd, stdout, stderr io.ReadCloser) {
 	defer func() {
 		stdout.Close()
+		stderr.Close()
+
 		r.mu.Lock()
 		r.running = false
 		r.mu.Unlock()
 		close(r.events)
+		close(r.done)
 	}()
 
+	// Read stderr concurrently — buffer it up so we can include it in error events
+	stderrCh := make(chan string, 1)
+	go func() {
+		var sb strings.Builder
+		io.Copy(&sb, stderr)
+		stderrCh <- sb.String()
+		close(stderrCh)
+	}()
+
+	// Read JSON events from stdout
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // 1MB max line
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024) // 10MB max line
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -143,18 +167,27 @@ func (r *Runner) streamEvents(stdout io.ReadCloser) {
 		}
 		r.events <- ev
 	}
-}
 
-func (r *Runner) waitExit(cmd *exec.Cmd) {
-	err := cmd.Wait()
-	if err != nil && err.Error() != "signal: killed" && r.running {
-		select {
-		case r.events <- &protocol.Event{
+	// Wait for process exit
+	werr := cmd.Wait()
+
+	// Collect stderr (may already be done)
+	stderrText := <-stderrCh
+
+	// If the process errored in a way that wasn't a signal kill, notify
+	if werr != nil && !strings.Contains(werr.Error(), "signal: killed") {
+		msg := fmt.Sprintf("agent exited: %v", werr)
+		if stderrText != "" {
+			// Truncate stderr to avoid flooding
+			if len(stderrText) > 2000 {
+				stderrText = stderrText[:2000] + "\n... (truncated)"
+			}
+			msg += "\nstderr:\n" + stderrText
+		}
+		// Send on events (channel not closed yet — we own the close in defer)
+		r.events <- &protocol.Event{
 			Type:    protocol.EventError,
-			Message: fmt.Sprintf("agent exited: %v", err),
-		}:
-		default:
+			Message: msg,
 		}
 	}
-	close(r.done)
 }

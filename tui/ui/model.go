@@ -5,6 +5,7 @@ package ui
 import (
 	"fmt"
 	"math"
+	"os"
 	"os/user"
 	"strings"
 	"time"
@@ -28,6 +29,7 @@ type Model struct {
 	agentRunner *agent.Runner
 	agentActive bool
 	agentStatus string // "ready", "running", "done", "error"
+	runID      int    // incremented each Start() to detect stale AgentDoneMsg
 
 	// Output
 	streamingOutput string    // accumulated text from current run (Pi-style)
@@ -35,13 +37,15 @@ type Model struct {
 	viewport        viewport.Model
 
 	// Input
-	input       textinput.Model
-	inputFocused bool
+	input textinput.Model
 
 	// Sidebar
 	sidebarWidth int
 	filesList    []string
 	modelName    string
+
+	// Pre-rendered history (rendered once when a turn completes, not on every chunk)
+	renderedHistory string
 
 	// Timing / metrics
 	startTime    time.Time
@@ -88,8 +92,7 @@ func NewModel(pythonPath, agentModule string) *Model {
 		agentRunner:   r,
 		agentStatus:   "ready",
 		agentActive:   false,
-		input:         ti,
-		inputFocused:  true,
+		input: ti,
 		sidebarWidth:  30,
 		modelName:     "deepseek-v4-flash:cloud",
 		help:          help.New(),
@@ -103,13 +106,14 @@ func NewModel(pythonPath, agentModule string) *Model {
 
 // AgentEventMsg is sent when a new protocol event arrives from the agent.
 type AgentEventMsg struct {
+	RunID int
 	Event *protocol.Event
 }
 
 // AgentDoneMsg is sent when the agent process exits.
-// SubmitMsg is sent when the user presses Enter to submit a prompt.
-// TickMsg is sent periodically for real-time status updates.
-type AgentDoneMsg struct{}
+type AgentDoneMsg struct {
+	RunID int
+}
 type SubmitMsg struct {
 	Prompt string
 }
@@ -129,15 +133,16 @@ func (m Model) Init() tea.Cmd {
 // waitForEvents returns a command that listens for agent events
 // and sends them as tea.Msg on the main loop.
 func (m Model) waitForEvents() tea.Cmd {
+	runID := m.runID // capture current run ID — reject if stale
 	return func() tea.Msg {
 		select {
 		case ev, ok := <-m.agentRunner.Events():
 			if !ok {
-				return AgentDoneMsg{}
+				return AgentDoneMsg{RunID: runID}
 			}
-			return AgentEventMsg{Event: ev}
+			return AgentEventMsg{RunID: runID, Event: ev}
 		case <-m.agentRunner.Done():
-			return AgentDoneMsg{}
+			return AgentDoneMsg{RunID: runID}
 		}
 	}
 }
@@ -163,29 +168,50 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.Width = m.contentWidth()
 		m.viewport.Height = m.contentHeight()
 		m.input.Width = m.contentWidth() - 6
+			if m.viewport.View() == "" {
+				m.viewport.SetContent("Ready. Describe your neuroscience analysis task below.\n\nExamples:\n  · \"Load BOLD data and compute functional connectivity\"\n  · \"Run spike sorting on neuropixels recording\"\n  · \"EEG time-frequency analysis on face vs house\"\n  · \"Simulate LIF network with STDP\"\n  · \"Permutation test with cluster correction\"")
+			}
 
 	// ── Key events ──────────────────────────────────
 
 	case tea.KeyMsg:
-		// If Enter is pressed while focused on input with text, submit the prompt
-		if msg.Type == tea.KeyEnter && m.focus == "input" && m.input.Value() != "" && !m.agentActive {
+		// Enter always submits if there's text and agent is idle — regardless of focus
+		if msg.Type == tea.KeyEnter && m.input.Value() != "" && !m.agentActive {
 			prompt := m.input.Value()
 			m.input.SetValue("")
 			m.agentStatus = "running"
 			m.agentActive = true
+			m.runID++
 			m.startTime = time.Now()
 			m.turnCount = 0
 
-			// Start new output with user's prompt visible
+			// Start new output with user's prompt visible, keeping history in view
 			m.streamingOutput = fmt.Sprintf("> %s\n\n", prompt)
-			m.viewport.SetContent(RenderMarkdown(m.streamingOutput))
+			displayText := m.renderedHistory
+			if m.renderedHistory != "" {
+				displayText += fmt.Sprintf("\n%s\n\n", strings.Repeat("─", min(m.contentWidth(), 20)))
+			}
+			displayText += sanitizePaths(RenderMarkdown(m.streamingOutput), m.homeDir)
+			m.viewport.Width = m.contentWidth()
+			m.viewport.Height = m.contentHeight()
+			m.viewport.SetContent(displayText)
+			m.viewport.GotoBottom()
 
 			localMode := !strings.Contains(m.modelName, ":cloud")
 			if err := m.agentRunner.Start(prompt, m.modelName, localMode); err != nil {
+				m.agentActive = false // FIX: reset so next Enter works
 				m.agentStatus = "error"
 				m.streamingOutput += fmt.Sprintf("\n❌ Error: %v\n", err)
+				// Refresh viewport so user sees the error
+				fullConv := m.buildConversation()
+				displayText = sanitizePaths(RenderMarkdown(fullConv), m.homeDir)
+				m.viewport.SetContent(displayText)
+				m.viewport.GotoBottom()
 				return m, nil
 			}
+			// Re-focus input for next prompt
+			m.focus = "input"
+			m.input.Focus()
 			// Register event listener for this run
 			cmds = append(cmds, m.waitForEvents())
 			return m, tea.Batch(cmds...)
@@ -194,10 +220,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Global keys
 		switch {
 		case key.Matches(msg, keys.Help):
+			if m.focus == "input" && msg.String() == "?" {
+				break
+			}
 			m.showHelp = !m.showHelp
 			return m, nil
-
 		case key.Matches(msg, keys.Quit):
+			if m.focus == "input" && msg.String() == "q" {
+				break
+			}
 			if m.agentActive {
 				m.agentRunner.Stop()
 				m.agentActive = false
@@ -205,7 +236,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.quitting = true
 			return m, tea.Quit
-
 		case key.Matches(msg, keys.Stop):
 			if m.agentActive {
 				m.agentRunner.Stop()
@@ -227,6 +257,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, keys.Clear):
 			m.streamingOutput = ""
 			m.outputHistory = nil
+			m.renderedHistory = ""
 			m.viewport.SetContent("")
 			m.viewport.GotoTop()
 			return m, nil
@@ -238,12 +269,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ── Agent events ────────────────────────────────
 
 	case AgentEventMsg:
+		// Reject events from a previous run (stale goroutine)
+		if msg.RunID != m.runID {
+			break
+		}
 		ev := msg.Event
 		switch ev.Type {
 		case protocol.EventText:
 			m.streamingOutput += ev.Content
-			fullConv := m.buildConversation()
-			displayText := sanitizePaths(RenderMarkdown(fullConv), m.homeDir)
+			// Show: pre-rendered history + current streaming (rendered fresh)
+			displayText := m.renderedHistory
+			if m.renderedHistory != "" && m.streamingOutput != "" {
+				displayText += fmt.Sprintf("\n%s\n\n", strings.Repeat("─", min(m.contentWidth(), 20)))
+			}
+			displayText += sanitizePaths(RenderMarkdown(m.streamingOutput), m.homeDir)
 			m.viewport.SetContent(displayText)
 			m.viewport.GotoBottom()
 			cmds = append(cmds, m.waitForEvents())
@@ -251,8 +290,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case protocol.EventToolCall:
 			callLine := fmt.Sprintf("  🔧 %s(%s)", ev.Name, formatArgs(ev.Arguments))
 			m.streamingOutput += "\n" + callLine + "\n"
-			fullConv := m.buildConversation()
-			displayText := sanitizePaths(RenderMarkdown(fullConv), m.homeDir)
+			displayText := m.renderedHistory
+			if m.renderedHistory != "" {
+				displayText += fmt.Sprintf("\n%s\n\n", strings.Repeat("─", min(m.contentWidth(), 20)))
+			}
+			displayText += sanitizePaths(RenderMarkdown(m.streamingOutput), m.homeDir)
 			m.viewport.SetContent(displayText)
 			m.viewport.GotoBottom()
 			cmds = append(cmds, m.waitForEvents())
@@ -263,8 +305,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.streamingOutput += fmt.Sprintf("  └─ %s\n", ev.Result)
 			}
-			fullConv := m.buildConversation()
-			displayText := sanitizePaths(RenderMarkdown(fullConv), m.homeDir)
+			displayText := m.renderedHistory
+			if m.renderedHistory != "" {
+				displayText += fmt.Sprintf("\n%s\n\n", strings.Repeat("─", min(m.contentWidth(), 20)))
+			}
+			displayText += sanitizePaths(RenderMarkdown(m.streamingOutput), m.homeDir)
 			m.viewport.SetContent(displayText)
 			cmds = append(cmds, m.waitForEvents())
 
@@ -283,39 +328,53 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if ev.IsError {
 				m.agentStatus = "error"
 			}
-			if m.streamingOutput != "" {
-				m.outputHistory = append(m.outputHistory, m.streamingOutput)
-				m.streamingOutput = ""
-			}
-			// Re-render conversation history
+			m = m.addRenderedHistory()
+			m.refreshFilesList()
+			// Re-render conversation
 			fullConv := m.buildConversation()
 			displayText := sanitizePaths(RenderMarkdown(fullConv), m.homeDir)
 			m.viewport.SetContent(displayText)
 			m.viewport.GotoBottom()
-			cmds = append(cmds, m.waitForEvents())
+			// Don't re-register waitForEvents — the agent process is done
+			// and AgentDoneMsg will arrive as channels close
 
 		case protocol.EventError:
 			m.agentActive = false
 			m.agentStatus = "error"
 			errorLine := fmt.Sprintf("\n❌ Error: %s\n", ev.Message)
 			m.streamingOutput += errorLine
+			m = m.addRenderedHistory()
+			// Show error in context of conversation history
 			fullConv := m.buildConversation()
 			displayText := sanitizePaths(RenderMarkdown(fullConv), m.homeDir)
 			m.viewport.SetContent(displayText)
 			m.viewport.GotoBottom()
-			cmds = append(cmds, m.waitForEvents())
+			// Don't re-register waitForEvents — the agent process is done
 		}
 
-		// Re-register the event listener for next event
-		// (also falls through to input/viewport updates below)
+
 
 	case AgentDoneMsg:
+		// Ignore stale DoneMsg from a previous run (only current or newer runIDs are valid)
+		if msg.RunID != 0 && msg.RunID < m.runID {
+			break
+		}
 		m.agentActive = false
+		// Don't overwrite a more specific status set by EventResult or EventError
 		if m.agentStatus == "running" {
 			m.agentStatus = "done"
 		}
-		// Don't re-register waitForEvents here — the runner's channels are closed.
-		// The next Enter press will register a new one.
+		// If nothing was ever rendered (agent died silently), show something
+		if m.streamingOutput == "" && len(m.renderedHistory) == 0 {
+			m.streamingOutput = "\n⚠️ Agent exited without producing output.\n"
+		}
+		// Persist partial output so it survives into the next turn
+		m = m.addRenderedHistory()
+		fullConv := m.buildConversation()
+		displayText := sanitizePaths(RenderMarkdown(fullConv), m.homeDir)
+		m.viewport.SetContent(displayText)
+		m.viewport.GotoBottom()
+		// Runner's channels are closed — next Enter press registers new listener
 
 	case TickMsg:
 		// Schedule next tick
@@ -331,7 +390,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// ── Update viewport ────────────────────────────
 	var vpCmd tea.Cmd
-	m.viewport, vpCmd = m.viewport.Update(msg)
+	if _, isKey := msg.(tea.KeyMsg); isKey {
+		if m.focus == "main" {
+			m.viewport, vpCmd = m.viewport.Update(msg)
+		}
+	} else {
+		m.viewport, vpCmd = m.viewport.Update(msg)
+	}
 	cmds = append(cmds, vpCmd)
 
 	return m, tea.Batch(cmds...)
@@ -364,6 +429,9 @@ func (m Model) View() string {
 		sideWidth = 20 // narrower on small terminals
 	}
 	mainWidth := m.width - sideWidth - 1 // -1 for border
+	if mainWidth < 1 {
+		mainWidth = 1
+	}
 
 	sidebarRendered := SidebarStyle.
 		Width(sideWidth).
@@ -440,14 +508,16 @@ func (m Model) sidebarView() string {
 
 // ── Main content ─────────────────────────────────────────────
 
-// buildConversation assembles all history + current streaming output into one string.
+// buildConversation assembles history blocks above the current streaming output.
+// History is static text (rendered once on completion).
+// Streaming output is the active turn being built.
 func (m Model) buildConversation() string {
-	contentWidth := m.contentWidth()
+	sepWidth := min(m.contentWidth(), 20)
 	var b strings.Builder
 	for i, entry := range m.outputHistory {
 		if i > 0 {
 			b.WriteString("\n")
-			b.WriteString(strings.Repeat("─", min(contentWidth, 20)))
+			b.WriteString(strings.Repeat("─", sepWidth))
 			b.WriteString("\n\n")
 		}
 		b.WriteString(entry)
@@ -455,7 +525,7 @@ func (m Model) buildConversation() string {
 	if m.streamingOutput != "" {
 		if len(m.outputHistory) > 0 {
 			b.WriteString("\n")
-			b.WriteString(strings.Repeat("─", min(contentWidth, 20)))
+			b.WriteString(strings.Repeat("─", sepWidth))
 			b.WriteString("\n\n")
 		}
 		b.WriteString(m.streamingOutput)
@@ -463,13 +533,63 @@ func (m Model) buildConversation() string {
 	return b.String()
 }
 
+// maxHistoryEntries caps the number of conversation turns kept in memory.
+const maxHistoryEntries = 10
+
+// addRenderedHistory appends the final streaming output to history as pre-rendered text,
+// then caps history to maxHistoryEntries and rebuilds the renderedHistory cache.
+func (m Model) addRenderedHistory() Model {
+	if m.streamingOutput == "" {
+		return m
+	}
+	// Save raw text to history for future access
+	m.outputHistory = append(m.outputHistory, m.streamingOutput)
+	m.streamingOutput = ""
+
+	// Cap history to prevent unbounded memory growth
+	if len(m.outputHistory) > maxHistoryEntries {
+		excess := len(m.outputHistory) - maxHistoryEntries
+		// Copy to new slice so GC can collect evicted entries
+		trimmed := make([]string, len(m.outputHistory)-excess)
+		copy(trimmed, m.outputHistory[excess:])
+		m.outputHistory = trimmed
+	}
+
+	// Rebuild pre-rendered history (render all entries once, not per chunk)
+	return m.rebuildRenderedHistory()
+}
+
+// rebuildRenderedHistory pre-renders all history entries into renderedHistory.
+// Called once when a turn completes, not on every streaming chunk.
+func (m Model) rebuildRenderedHistory() Model {
+	sepWidth := min(m.contentWidth(), 20)
+	var b strings.Builder
+	for i, entry := range m.outputHistory {
+		if i > 0 {
+			b.WriteString("\n")
+			b.WriteString(strings.Repeat("─", sepWidth))
+			b.WriteString("\n\n")
+		}
+		b.WriteString(entry)
+	}
+	m.renderedHistory = sanitizePaths(RenderMarkdown(b.String()), m.homeDir)
+	return m
+}
+
 func (m Model) mainView() string {
 	contentWidth := m.contentWidth()
-	contentHeight := m.contentHeight()
 
 	title := OutputTitle.Render("🧠 Comp-Neuroscientist")
 
-	displayContent := m.buildConversation()
+	// Use pre-rendered history + fresh render of current streaming output
+	// This avoids re-rendering the full conversation on every View() call
+	displayContent := m.renderedHistory
+	if m.streamingOutput != "" {
+		if m.renderedHistory != "" {
+			displayContent += fmt.Sprintf("\n%s\n\n", strings.Repeat("─", min(contentWidth, 20)))
+		}
+		displayContent += sanitizePaths(RenderMarkdown(m.streamingOutput), m.homeDir)
+	}
 	if displayContent == "" {
 		displayContent = "Ready. Describe your neuroscience analysis task below.\n\n" +
 			"Examples:\n" +
@@ -480,9 +600,6 @@ func (m Model) mainView() string {
 			"  · \"Permutation test with cluster correction\""
 	}
 
-	m.viewport.Width = contentWidth
-	m.viewport.Height = contentHeight
-	m.viewport.SetContent(displayContent)
 
 	return lipgloss.JoinVertical(
 		lipgloss.Top,
@@ -517,8 +634,9 @@ func (m Model) statusBarView() string {
 	}
 
 	modelLabel := m.modelName
-	if len(modelLabel) > 20 {
-		modelLabel = modelLabel[:17] + "..."
+	runes := []rune(modelLabel)
+	if len(runes) > 20 {
+		modelLabel = string(runes[:17]) + "..."
 	}
 
 	return StatusBar.Render(
@@ -539,11 +657,19 @@ func (m Model) helpView() string {
 // ── Helpers ───────────────────────────────────────────────
 
 func (m Model) contentWidth() int {
-	return m.width - m.sidebarWidth - 6 // -6 for padding
+	w := m.width - m.sidebarWidth - 6 // -6 for padding
+	if w < 1 {
+		w = 1
+	}
+	return w
 }
 
 func (m Model) contentHeight() int {
-	return m.height - 8 // -8 for title, input, status bar, padding
+	h := m.height - 8 // -8 for title, input, status bar, padding
+	if h < 1 {
+		h = 1
+	}
+	return h
 }
 
 // formatArgs formats tool call arguments for display.
@@ -577,6 +703,40 @@ func (m Model) statusStyle() lipgloss.Style {
 	default:
 		return StatusReady
 	}
+}
+
+// refreshFilesList scans the results directory for output files and updates the sidebar.
+func (m *Model) refreshFilesList() {
+	entries, err := os.ReadDir("results")
+	if err != nil {
+		m.filesList = nil
+		return
+	}
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			files = append(files, e.Name())
+		}
+	}
+	// Also scan subdirectories
+	for _, sub := range []string{"plots", "models", "processed"} {
+		subEntries, err := os.ReadDir("results/" + sub)
+		if err != nil {
+			continue
+		}
+		for _, e := range subEntries {
+			if !e.IsDir() {
+				files = append(files, sub+"/"+e.Name())
+			}
+		}
+	}
+	if len(files) > 20 {
+		files = files[:20]
+	}
+	if files == nil {
+		files = []string{}
+	}
+	m.filesList = files
 }
 
 // sanitizePaths replaces absolute home directory paths with ~ for privacy.

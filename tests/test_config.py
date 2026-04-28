@@ -9,6 +9,7 @@ def test_default_model():
 
 
 def test_default_local_model(monkeypatch):
+    monkeypatch.delenv("CN_MODEL", raising=False)
     monkeypatch.setenv("CN_LOCAL", "1")
     c = Config()
     assert c.model == "llama3.1"
