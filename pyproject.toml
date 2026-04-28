@@ -1,0 +1,21 @@
+[project]
+name = "comp-neuroscientist"
+version = "0.1.0"
+description = "Autonomous Computational Neuroscience Agent — fMRI, EEG, calcium, ephys, encoding, simulation"
+requires-python = ">=3.13"
+dependencies = [
+    "openai>=1.0",
+    "pydantic>=2.0",
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "compneuro-toolkit>=2.0",
+]
+
+[project.optional-dependencies]
+fast-tokens = ["tiktoken>=0.8"]
+
+[project.scripts]
+comp-neuroscientist = "comp_neuroscientist.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
