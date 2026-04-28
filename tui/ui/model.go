@@ -135,6 +135,20 @@ func (m Model) Init() tea.Cmd {
 func (m Model) waitForEvents() tea.Cmd {
 	runID := m.runID // capture current run ID — reject if stale
 	return func() tea.Msg {
+		// Non-blocking drain: consume any buffered event before waiting.
+		// This prevents data loss when Done() closes simultaneously with
+		// the last buffered events still in the channel.
+		select {
+		case ev, ok := <-m.agentRunner.Events():
+			if ok {
+				return AgentEventMsg{RunID: runID, Event: ev}
+			}
+			// Channel closed — agent is done
+			return AgentDoneMsg{RunID: runID}
+		default:
+		}
+
+		// Blocking wait for the next event or done signal
 		select {
 		case ev, ok := <-m.agentRunner.Events():
 			if !ok {
@@ -489,7 +503,7 @@ func (m Model) sidebarView() string {
 	b.WriteString(QuickBtn.Render("F5 EDA") + "\n")
 	b.WriteString(QuickBtn.Render("F6 Pipeline") + "\n")
 	b.WriteString(QuickBtn.Render("^N New") + "\n")
-	b.WriteString(QuickBtn.Render("^C Stop") + "\n")
+	b.WriteString(QuickBtn.Render("^K Stop") + "\n")
 
 	// Keyboard shortcuts
 	b.WriteString("\n")
@@ -666,8 +680,25 @@ func (m Model) helpView() string {
 
 // ── Helpers ───────────────────────────────────────────────
 
+// ── Layout helpers ──────────────────────────────────────────
+
+// contentWidthPadding is the horizontal space consumed by layout chrome
+// between the outer window edge and the inner content area:
+//   - Sidebar right border: 1
+//   - Sidebar right padding: 1
+//   - Visual gap: 4
+const contentWidthPadding = 6
+
+// contentHeightPadding is the vertical space consumed by title, input
+// area, status bar, and gaps between them:
+//   - OutputTitle + border: 2
+//   - InputContainer + border: 2
+//   - StatusBar: 1
+//   - Gaps: 3
+const contentHeightPadding = 8
+
 func (m Model) contentWidth() int {
-	w := m.width - m.sidebarWidth - 6 // -6 for padding
+	w := m.width - m.sidebarWidth - contentWidthPadding
 	if w < 1 {
 		w = 1
 	}
@@ -675,7 +706,7 @@ func (m Model) contentWidth() int {
 }
 
 func (m Model) contentHeight() int {
-	h := m.height - 8 // -8 for title, input, status bar, padding
+	h := m.height - contentHeightPadding
 	if h < 1 {
 		h = 1
 	}
@@ -780,8 +811,8 @@ var keys = keyMap{
 		key.WithHelp("q/^C", "quit"),
 	),
 	Stop: key.NewBinding(
-		key.WithKeys("ctrl+z"),
-		key.WithHelp("^Z", "stop agent"),
+		key.WithKeys("ctrl+k"),
+		key.WithHelp("^K", "stop agent"),
 	),
 	FocusInput: key.NewBinding(
 		key.WithKeys("ctrl+e"),

@@ -132,6 +132,14 @@ func (r *Runner) Stop() error {
 // for the process to exit. Owns both channel closes (events + done).
 func (r *Runner) streamAndWait(cmd *exec.Cmd, stdout, stderr io.ReadCloser) {
 	defer func() {
+		if rec := recover(); rec != nil {
+			// If the agent goroutine panics, we must still close channels
+			// to prevent the TUI from hanging indefinitely. Log the panic
+			// so it can be diagnosed.
+			fmt.Fprintf(os.Stderr, "agent: panic in streamAndWait: %v\n", rec)
+		}
+	}()
+	defer func() {
 		stdout.Close()
 		stderr.Close()
 
@@ -145,6 +153,12 @@ func (r *Runner) streamAndWait(cmd *exec.Cmd, stdout, stderr io.ReadCloser) {
 	// Read stderr concurrently — buffer it up so we can include it in error events
 	stderrCh := make(chan string, 1)
 	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				fmt.Fprintf(os.Stderr, "agent: panic reading stderr: %v\n", rec)
+				stderrCh <- fmt.Sprintf("[panic reading stderr: %v]", rec)
+			}
+		}()
 		var sb strings.Builder
 		io.Copy(&sb, stderr)
 		stderrCh <- sb.String()
