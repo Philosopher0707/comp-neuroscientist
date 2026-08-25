@@ -133,21 +133,49 @@ func (r *Runner) Stop() error {
 func (r *Runner) streamAndWait(cmd *exec.Cmd, stdout, stderr io.ReadCloser) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			// If the agent goroutine panics, we must still close channels
-			// to prevent the TUI from hanging indefinitely. Log the panic
-			// so it can be diagnosed.
 			fmt.Fprintf(os.Stderr, "agent: panic in streamAndWait: %v\n", rec)
 		}
 	}()
+
+	var (
+		eventsClosed bool
+		doneClosed   bool
+		closeMu      sync.Mutex
+	)
+	closeEvents := func() {
+		closeMu.Lock()
+		defer closeMu.Unlock()
+		if !eventsClosed {
+			close(r.events)
+			eventsClosed = true
+		}
+	}
+	closeDone := func() {
+		closeMu.Lock()
+		defer closeMu.Unlock()
+		if !doneClosed {
+			close(r.done)
+			doneClosed = true
+		}
+	}
+	safeSend := func(ev *protocol.Event) bool {
+		closeMu.Lock()
+		defer closeMu.Unlock()
+		if eventsClosed {
+			return false
+		}
+		r.events <- ev
+		return true
+	}
+
 	defer func() {
 		stdout.Close()
 		stderr.Close()
-
 		r.mu.Lock()
 		r.running = false
 		r.mu.Unlock()
-		close(r.events)
-		close(r.done)
+		closeEvents()
+		closeDone()
 	}()
 
 	// Read stderr concurrently — buffer it up so we can include it in error events
@@ -198,10 +226,10 @@ func (r *Runner) streamAndWait(cmd *exec.Cmd, stdout, stderr io.ReadCloser) {
 			}
 			msg += "\nstderr:\n" + stderrText
 		}
-		// Send on events (channel not closed yet — we own the close in defer)
-		r.events <- &protocol.Event{
+		// Send on events (not closed yet - safeSend checks flag)
+		safeSend(&protocol.Event{
 			Type:    protocol.EventError,
 			Message: msg,
-		}
+		})
 	}
 }

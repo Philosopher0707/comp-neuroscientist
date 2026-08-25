@@ -12,6 +12,7 @@ import (
 
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
@@ -35,6 +36,7 @@ type Model struct {
 	streamingOutput string    // accumulated text from current run (Pi-style)
 	outputHistory   []string  // completed output blocks
 	viewport        viewport.Model
+	spinner         spinner.Model
 
 	// Input
 	input textinput.Model
@@ -68,6 +70,16 @@ type Model struct {
 
 	// Quit flag
 	quitting bool
+
+	// Scroll tracking
+	userScrolledUp bool
+
+	// Prompt history (↑↓ navigation)
+	promptHistory []string
+	promptIndex   int // -1 = new prompt, 0..len-1 = history
+
+	// Multiline input mode
+	multiline bool
 }
 
 // NewModel creates the initial Bubble Tea model.
@@ -78,6 +90,16 @@ func NewModel(pythonPath, agentModule string) *Model {
 	ti.CharLimit = 1000
 	ti.SetWidth(60)
 	ti.Prompt = "┃ "
+
+	// Spinner for showing agent activity
+	s := spinner.New(
+		spinner.WithSpinner(spinner.Dot),
+		spinner.WithStyle(lipgloss.NewStyle().Foreground(ColorGreen)),
+	)
+
+	// Viewport — zero-value breaks rendering; must be initialised
+	vp := viewport.New(viewport.WithWidth(80), viewport.WithHeight(20))
+	vp.SetContent("Ready. Describe your neuroscience analysis task below...")
 
 	// Start the agent runner (not running yet)
 	r := agent.NewRunner(pythonPath, agentModule)
@@ -92,12 +114,16 @@ func NewModel(pythonPath, agentModule string) *Model {
 		agentRunner:   r,
 		agentStatus:   "ready",
 		agentActive:   false,
-		input: ti,
+		input:         ti,
+		spinner:       s,
+		viewport:      vp,
 		sidebarWidth:  30,
 		modelName:     "deepseek-v4-flash:cloud",
 		help:          help.New(),
 		focus:         "input",
 		outputHistory: []string{},
+		promptHistory: []string{},
+		promptIndex:   -1,
 		homeDir:       homeDir,
 	}
 }
@@ -126,6 +152,7 @@ func (m Model) Init() tea.Cmd {
 		textinput.Blink,
 		// waitForEvents is NOT registered here — it blocks forever on empty channels.
 		// The Enter handler registers it when the agent starts.
+		// Spinner tick is NOT started here — it starts when the agent starts.
 		m.tick(),
 	)
 }
@@ -198,6 +225,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.runID++
 			m.startTime = time.Now()
 			m.turnCount = 0
+			m.userScrolledUp = false
 
 			// Start new output with user's prompt visible, keeping history in view
 			m.streamingOutput = fmt.Sprintf("> %s\n\n", prompt)
@@ -228,6 +256,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.Focus()
 			// Register event listener for this run
 			cmds = append(cmds, m.waitForEvents())
+			// Start the spinner animation
+			cmds = append(cmds, m.spinner.Tick)
 			return m, tea.Batch(cmds...)
 		}
 
@@ -298,7 +328,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			displayText += sanitizePaths(RenderMarkdown(m.streamingOutput), m.homeDir)
 			m.viewport.SetContent(displayText)
-			m.viewport.GotoBottom()
+			if !m.userScrolledUp {
+				m.viewport.GotoBottom()
+			}
 			cmds = append(cmds, m.waitForEvents())
 
 		case protocol.EventToolCall:
@@ -310,7 +342,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			displayText += sanitizePaths(RenderMarkdown(m.streamingOutput), m.homeDir)
 			m.viewport.SetContent(displayText)
-			m.viewport.GotoBottom()
+			if !m.userScrolledUp {
+				m.viewport.GotoBottom()
+			}
 			cmds = append(cmds, m.waitForEvents())
 
 		case protocol.EventToolResult:
@@ -348,7 +382,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			fullConv := m.buildConversation()
 			displayText := sanitizePaths(RenderMarkdown(fullConv), m.homeDir)
 			m.viewport.SetContent(displayText)
-			m.viewport.GotoBottom()
+			if !m.userScrolledUp {
+				m.viewport.GotoBottom()
+			}
 			// Don't re-register waitForEvents — the agent process is done
 			// and AgentDoneMsg will arrive as channels close
 
@@ -362,7 +398,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			fullConv := m.buildConversation()
 			displayText := sanitizePaths(RenderMarkdown(fullConv), m.homeDir)
 			m.viewport.SetContent(displayText)
-			m.viewport.GotoBottom()
+			if !m.userScrolledUp {
+				m.viewport.GotoBottom()
+			}
 			// Don't re-register waitForEvents — the agent process is done
 		}
 
@@ -387,12 +425,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		fullConv := m.buildConversation()
 		displayText := sanitizePaths(RenderMarkdown(fullConv), m.homeDir)
 		m.viewport.SetContent(displayText)
-		m.viewport.GotoBottom()
+		if !m.userScrolledUp {
+			m.viewport.GotoBottom()
+		}
 		// Runner's channels are closed — next Enter press registers new listener
 
 	case TickMsg:
 		// Schedule next tick
 		cmds = append(cmds, m.tick())
+
+	case spinner.TickMsg:
+		// Advance the spinner animation frame
+		var spinCmd tea.Cmd
+		m.spinner, spinCmd = m.spinner.Update(msg)
+		// Only keep spinning while the agent is active
+		if m.agentActive {
+			cmds = append(cmds, spinCmd)
+		}
 	}
 
 	// ── Update input (only when focused) ────────────
@@ -405,20 +454,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ── Update viewport ────────────────────────────
 	// Skip WindowSizeMsg — we handle dimensions manually in the case above
 	// to prevent the viewport's internal resize handler from duplicating content.
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		// handled above
-	default:
-		var vpCmd tea.Cmd
-		if _, isKey := msg.(tea.KeyMsg); isKey {
-			if m.focus == "main" {
-				m.viewport, vpCmd = m.viewport.Update(msg)
-			}
-		} else {
+	var vpCmd tea.Cmd
+	if _, isKey := msg.(tea.KeyMsg); isKey {
+		if m.focus == "main" {
 			m.viewport, vpCmd = m.viewport.Update(msg)
 		}
-		cmds = append(cmds, vpCmd)
+	} else {
+		m.viewport, vpCmd = m.viewport.Update(msg)
 	}
+	cmds = append(cmds, vpCmd)
 
 	return m, tea.Batch(cmds...)
 }
@@ -485,7 +529,12 @@ func (m Model) sidebarView() string {
 	// Status section
 	b.WriteString(SidebarTitle.Render("📊 Status"))
 	b.WriteString("\n")
-	b.WriteString(StatusLabel.Render("Status:") + " " + m.statusStyle().Render(m.agentStatus) + "\n")
+	// Show animated spinner when agent is running
+	statusText := m.agentStatus
+	if m.agentActive {
+		statusText = m.spinner.View() + " " + m.agentStatus
+	}
+	b.WriteString(StatusLabel.Render("Status:") + " " + m.statusStyle().Render(statusText) + "\n")
 	b.WriteString(StatusLabel.Render("Model:") + " " + StatusValue.Render(m.modelName) + "\n")
 	if m.agentActive {
 		elapsed := time.Since(m.startTime).Round(time.Second)
@@ -603,7 +652,11 @@ func (m Model) rebuildRenderedHistory() Model {
 func (m Model) mainView() string {
 	contentWidth := m.contentWidth()
 
-	title := OutputTitle.Render("🧠 Comp-Neuroscientist")
+	titleText := "🧠 Comp-Neuroscientist"
+	if m.agentActive {
+		titleText = m.spinner.View() + " " + titleText + fmt.Sprintf("  (turn %d)", m.turnCount)
+	}
+	title := OutputTitle.Render(titleText)
 
 	// Use pre-rendered history + fresh render of current streaming output
 	// This avoids re-rendering the full conversation on every View() call
@@ -638,7 +691,13 @@ func (m Model) inputView() string {
 	prompt := InputPrompt.Render("┃ ")
 	help := InputHelp.Render("Enter to submit · Shift+Enter newline · Esc focus main · ? help")
 
-	return InputContainer.Render(
+	// Highlight input border when focused
+	inputStyle := InputContainer
+	if m.focus == "input" {
+		inputStyle = inputStyle.BorderForeground(ColorBlue)
+	}
+
+	return inputStyle.Render(
 		prompt + m.input.View() + "\n" + help,
 	)
 }
@@ -675,7 +734,7 @@ func (m Model) statusBarView() string {
 // ── Help view ─────────────────────────────────────────────
 
 func (m Model) helpView() string {
-	return help.New().View(keys)
+	return m.help.View(keys)
 }
 
 // ── Helpers ───────────────────────────────────────────────
