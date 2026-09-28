@@ -30,11 +30,12 @@ type Model struct {
 	agentRunner *agent.Runner
 	agentActive bool
 	agentStatus string // "ready", "running", "done", "error"
-	runID      int    // incremented each Start() to detect stale AgentDoneMsg
+	runID       int    // incremented each Start() to detect stale AgentDoneMsg
 
 	// Output
-	streamingOutput string    // accumulated text from current run (Pi-style)
-	outputHistory   []string  // completed output blocks
+	streamingOutput string   // accumulated text from current run (Pi-style)
+	outputHistory   []string // completed output blocks
+	receivedText    bool     // saw a text event this run (guards duplicate final answer)
 	viewport        viewport.Model
 	spinner         spinner.Model
 
@@ -50,9 +51,9 @@ type Model struct {
 	renderedHistory string
 
 	// Timing / metrics
-	startTime    time.Time
-	turnCount    int
-	durationMs   int64
+	startTime  time.Time
+	turnCount  int
+	durationMs int64
 
 	// Window size
 	width  int
@@ -229,6 +230,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Start new output with user's prompt visible, keeping history in view
 			m.streamingOutput = fmt.Sprintf("> %s\n\n", prompt)
+			// Each run tracks its own text streaming; otherwise run 2's result
+			// event would be suppressed by run 1 having set this flag.
+			m.receivedText = false
 			displayText := m.renderedHistory
 			if m.renderedHistory != "" {
 				displayText += fmt.Sprintf("\n%s\n\n", strings.Repeat("─", min(m.contentWidth(), 20)))
@@ -321,6 +325,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch ev.Type {
 		case protocol.EventText:
 			m.streamingOutput += ev.Content
+			m.receivedText = true
 			// Show: pre-rendered history + current streaming (rendered fresh)
 			displayText := m.renderedHistory
 			if m.renderedHistory != "" && m.streamingOutput != "" {
@@ -376,6 +381,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if ev.IsError {
 				m.agentStatus = "error"
 			}
+			// The final answer arrives on the "text" key of the result event.
+			// Normally the same text already streamed in as "text" events and
+			// is sitting in streamingOutput — appending it again would print
+			// the answer twice. Only fall back to result.text when the run
+			// produced no text events at all (e.g. a non-streaming agent).
+			if ev.Text != "" && !m.receivedText {
+				m.streamingOutput += ev.Text
+			}
 			m = m.addRenderedHistory()
 			m.refreshFilesList()
 			// Re-render conversation
@@ -403,8 +416,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// Don't re-register waitForEvents — the agent process is done
 		}
-
-
 
 	case AgentDoneMsg:
 		// Ignore stale DoneMsg from a previous run (only current or newer runIDs are valid)
@@ -677,7 +688,6 @@ func (m Model) mainView() string {
 			"  · \"Permutation test with cluster correction\""
 	}
 
-
 	return lipgloss.JoinVertical(
 		lipgloss.Top,
 		title,
@@ -850,14 +860,14 @@ func sanitizePaths(text, homeDir string) string {
 // ── Key bindings ───────────────────────────────────────────
 
 type keyMap struct {
-	Help       key.Binding
-	Quit       key.Binding
-	Stop       key.Binding
-	FocusInput key.Binding
+	Help        key.Binding
+	Quit        key.Binding
+	Stop        key.Binding
+	FocusInput  key.Binding
 	FocusOutput key.Binding
-	Clear      key.Binding
-	Up         key.Binding
-	Down       key.Binding
+	Clear       key.Binding
+	Up          key.Binding
+	Down        key.Binding
 }
 
 var keys = keyMap{

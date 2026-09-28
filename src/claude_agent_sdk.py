@@ -54,6 +54,30 @@ class ResultMessage:
 
 
 @dataclass
+class ToolUseMessage:
+    """Emitted just before a tool handler runs.
+
+    Additive: consumers that only match AssistantMessage/ResultMessage are
+    unaffected, which preserves the documented "public API stays the same"
+    contract while making tool activity observable to the event stream.
+    """
+    name: str = ""
+    arguments: dict = field(default_factory=dict)
+    tool_use_id: str = ""
+    turn: int = 0
+
+
+@dataclass
+class ToolResultMessage:
+    """Emitted after a tool handler returns, with its (possibly truncated) result."""
+    name: str = ""
+    result: str = ""
+    tool_use_id: str = ""
+    turn: int = 0
+    is_error: bool = False
+
+
+@dataclass
 class ClaudeAgentOptions:
     max_turns: int = 30
     model: Optional[str] = None
@@ -466,9 +490,17 @@ async def _run_agent_loop(
                 continue
 
             handler = _TOOL_MAP.get(name)
+            is_error = False
             if handler is None:
                 result_text = f"[ToolError] Unknown tool: {name}"
+                is_error = True
             else:
+                yield ToolUseMessage(
+                    name=name,
+                    arguments=args,
+                    tool_use_id=call_id,
+                    turn=turn_num,
+                )
                 # Run tool in thread pool (all handlers are sync)
                 try:
                     result_text = await asyncio.get_running_loop().run_in_executor(
@@ -476,6 +508,15 @@ async def _run_agent_loop(
                     )
                 except Exception as exc:
                     result_text = f"[ToolError] {type(exc).__name__}: {exc}"
+                    is_error = True
+
+            yield ToolResultMessage(
+                name=name,
+                result=result_text,
+                tool_use_id=call_id,
+                turn=turn_num,
+                is_error=is_error,
+            )
 
             tool_results.append({
                 "tool_call_id": call_id,

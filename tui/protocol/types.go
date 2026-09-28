@@ -3,12 +3,12 @@
 //
 // The Python agent writes one JSON object per line to stdout:
 //
-//   {"type":"text","content":"analyzing fMRI data..."}
-//   {"type":"tool_call","name":"Bash","arguments":{"command":"python ..."}}
-//   {"type":"tool_result","name":"Bash","result":"[exit 0] done"}
-//   {"type":"status","status":"running","turns":1}
-//   {"type":"result","text":"Final report...","turns":3,"duration_ms":12500,"is_error":false}
-//   {"type":"error","message":"API connection failed"}
+//	{"type":"text","content":"analyzing fMRI data..."}
+//	{"type":"tool_call","name":"Bash","arguments":{"command":"python ..."}}
+//	{"type":"tool_result","name":"Bash","result":"[exit 0] done"}
+//	{"type":"status","status":"running","turns":1}
+//	{"type":"result","text":"Final report...","turns":3,"duration_ms":12500,"is_error":false}
+//	{"type":"error","message":"API connection failed"}
 //
 // The Go TUI reads these lines, parses them, and updates the UI accordingly.
 package protocol
@@ -22,12 +22,12 @@ import (
 type EventType string
 
 const (
-	EventText     EventType = "text"
-	EventToolCall EventType = "tool_call"
+	EventText       EventType = "text"
+	EventToolCall   EventType = "tool_call"
 	EventToolResult EventType = "tool_result"
-	EventStatus   EventType = "status"
-	EventResult   EventType = "result"
-	EventError    EventType = "error"
+	EventStatus     EventType = "status"
+	EventResult     EventType = "result"
+	EventError      EventType = "error"
 )
 
 // Event is the top-level envelope for all agent output events.
@@ -36,6 +36,11 @@ type Event struct {
 
 	// Text / content
 	Content string `json:"content,omitempty"`
+
+	// Text is the final answer carried by a "result" event. It is a distinct
+	// key from Content (used by "text" events) and must be declared, or
+	// encoding/json silently drops the agent's final answer.
+	Text string `json:"text,omitempty"`
 
 	// Tool call info
 	Name      string                 `json:"name,omitempty"`

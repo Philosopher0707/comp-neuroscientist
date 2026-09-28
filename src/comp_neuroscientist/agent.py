@@ -21,6 +21,8 @@ from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
     TextBlock,
+    ToolUseMessage,
+    ToolResultMessage,
 )
 
 from .config import config
@@ -85,6 +87,23 @@ def consume_stream(
 
                 if msg.model:
                     pass  # model info available
+
+            elif isinstance(msg, ToolUseMessage):
+                if json_mode:
+                    _emit_json({"type": "status", "status": "running", "turns": msg.turn})
+                    _emit_json({
+                        "type": "tool_call",
+                        "name": msg.name,
+                        "arguments": msg.arguments,
+                    })
+
+            elif isinstance(msg, ToolResultMessage):
+                if json_mode:
+                    _emit_json({
+                        "type": "tool_result",
+                        "name": msg.name,
+                        "result": msg.result,
+                    })
 
             elif isinstance(msg, ResultMessage):
                 turns = msg.num_turns
