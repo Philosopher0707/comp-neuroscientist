@@ -356,14 +356,22 @@ class ToolError(Exception):
 
 
 def _safe_resolve(path_str: str) -> Path:
-    """Resolve a path, keeping it inside the working directory tree."""
+    """Normalize a path to an absolute, symlink-resolved location.
+
+    Relative paths are anchored at the current working directory and ``~`` is
+    expanded.
+
+    NOTE: this enforces no containment boundary. An absolute path, or a
+    relative path containing ``..``, is resolved wherever it points, so the
+    callers -- ``_read``, ``_write`` and ``_grep`` -- can reach outside the
+    working directory. Callers that require a boundary must check for
+    themselves; nothing here does.
+    """
     p = Path(path_str).expanduser()
     # If relative, resolve against cwd
     if not p.is_absolute():
         p = Path.cwd() / p
-    p = p.resolve()
-    # No traversal above cwd is enforced by resolve()
-    return p
+    return p.resolve()
 
 
 def _interpreter_code(parts: list[str]) -> str | None:
