@@ -77,12 +77,14 @@ func (r *Runner) Start(prompt, modelName string, localMode bool) error {
 	// Build command: python3 -m comp_neuroscientist.cli --json "prompt"
 	cmd := exec.CommandContext(ctx, r.python, "-m", r.agentPkg, "--json", prompt)
 
-	// Inherit parent env and add our vars (critical: PATH, HOME must be present)
-	cmd.Env = append(os.Environ(),
-		"ANTHROPIC_AUTH_TOKEN=ollama",
-		"ANTHROPIC_BASE_URL=http://localhost:11434",
-		"PYTHONPATH=src",
-	)
+	// Inherit parent env and add our vars (critical: PATH, HOME must be present).
+	//
+	// Deliberately NOT setting ANTHROPIC_* here: Config is the single authority
+	// for endpoint and credential, and the SDK reads the endpoint from
+	// ClaudeAgentOptions.base_url. Exporting ANTHROPIC_BASE_URL from here would
+	// reintroduce a second, dead authority that a future reader could mistake
+	// for the real one. CN_MODEL / CN_LOCAL below are the only knobs.
+	cmd.Env = append(os.Environ(), "PYTHONPATH=src")
 
 	// Pass model and local mode info
 	cmd.Env = append(cmd.Env, "CN_MODEL="+modelName)

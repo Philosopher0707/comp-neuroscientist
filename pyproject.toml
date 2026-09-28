@@ -2,7 +2,7 @@
 name = "comp-neuroscientist"
 version = "0.1.0"
 description = "Autonomous Computational Neuroscience Agent — fMRI, EEG, calcium, ephys, encoding, simulation"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
     "openai>=1.0",
     "pydantic>=2.0",
