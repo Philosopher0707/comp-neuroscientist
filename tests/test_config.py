@@ -100,3 +100,39 @@ def test_from_env(monkeypatch):
     c = Config.from_env()
     assert c.model == "glm-5.1:cloud"
     assert c.max_turns == 50
+
+
+# ─── D3: _safe_int_env range check ─────────────────────────────
+# _safe_int_env accepted any int, so CN_MAX_TURNS=-1 propagated into
+# Config.max_turns, where a caller that never checks would read it as a
+# turn budget rather than the "unlimited" sentinel it looks like.
+
+
+def test_safe_int_env_rejects_negative(monkeypatch):
+    monkeypatch.setenv("TEST_VAL", "-1")
+    assert _safe_int_env("TEST_VAL", 10) == 10
+
+
+def test_safe_int_env_rejects_zero(monkeypatch):
+    monkeypatch.setenv("TEST_VAL", "0")
+    assert _safe_int_env("TEST_VAL", 10) == 10
+
+
+def test_safe_int_env_accepts_positive(monkeypatch):
+    monkeypatch.setenv("TEST_VAL", "1")
+    assert _safe_int_env("TEST_VAL", 10) == 1
+
+
+def test_safe_int_env_respects_explicit_minimum(monkeypatch):
+    monkeypatch.setenv("TEST_VAL", "0")
+    assert _safe_int_env("TEST_VAL", 10, minimum=0) == 0
+
+
+def test_max_turns_negative_env_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("CN_MAX_TURNS", "-1")
+    assert Config.from_env().max_turns == 30
+
+
+def test_max_turns_zero_env_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("CN_MAX_TURNS", "0")
+    assert Config.from_env().max_turns == 30

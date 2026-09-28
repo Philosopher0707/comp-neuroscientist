@@ -177,14 +177,24 @@ def _resolve_default_model() -> str:
     return _DEFAULT_CLOUD_MODEL
 
 
-def _safe_int_env(key: str, default: int) -> int:
+def _safe_int_env(key: str, default: int, minimum: int = 1) -> int:
+    """Read an integer env var, falling back to `default` when unusable.
+
+    Fails closed: a value that is not an integer, or that falls below
+    `minimum`, yields `default` instead of propagating a nonsensical setting
+    (e.g. CN_MAX_TURNS=-1, which would mean "unlimited" to a caller that
+    never checks for it).
+    """
     raw = os.environ.get(key, "")
     if not raw:
         return default
     try:
-        return int(raw)
+        value = int(raw)
     except ValueError:
         return default
+    if value < minimum:
+        return default
+    return value
 
 
 config = Config.from_env()
