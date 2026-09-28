@@ -11,9 +11,8 @@ import asyncio
 import json
 import os
 import sys
-import time
 from pathlib import Path
-from typing import AsyncIterator, List, Optional
+from typing import AsyncIterator, List
 
 from claude_agent_sdk import (
     query,
@@ -66,8 +65,6 @@ def consume_stream(
     In JSON mode: writes JSON events to stdout for the Go TUI to consume.
     """
     collected: List[str] = []
-    result_status = "running"
-    turns = 0
 
     try:
         while True:
@@ -106,15 +103,11 @@ def consume_stream(
                     })
 
             elif isinstance(msg, ResultMessage):
-                turns = msg.num_turns
                 if msg.is_error:
-                    result_status = "error"
                     if json_mode:
                         _emit_json({"type": "error", "message": msg.errors})
                     else:
                         print(f"\n\n[Error: {msg.errors}]", flush=True)
-                else:
-                    result_status = "success"
 
                 if json_mode:
                     _emit_json({
@@ -129,13 +122,11 @@ def consume_stream(
                           flush=True)
 
     except KeyboardInterrupt:
-        result_status = "interrupted"
         if json_mode:
             _emit_json({"type": "error", "message": "interrupted"})
         print("\n[Interrupted]", flush=True)
 
     except Exception as exc:
-        result_status = "error"
         if json_mode:
             _emit_json({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
         print(f"\n[Unexpected error: {type(exc).__name__}: {exc}]", flush=True)
@@ -152,11 +143,13 @@ def _emit_json(obj: dict) -> None:
 # ─── Setup environment ─────────────────────────────────────────
 
 def _setup_environment(prompt: str) -> ClaudeAgentOptions:
-    """Configure the agent options from config and the prompt's domain."""
-    # Determine which agents might be relevant based on keywords in the prompt
-    relevant_agents: dict = {}
-    prompt_lower = prompt.lower()
+    """Configure the agent options from config.
 
+    Args:
+        prompt: The user's prompt. Unused — all subagents are always exposed
+            and the orchestrator decides which to invoke — but retained in the
+            signature because callers pass it and it documents the contract.
+    """
     # Always include all agents — the orchestrator decides when to use them
     relevant_agents = dict(ALL_SUBAGENTS)
 
