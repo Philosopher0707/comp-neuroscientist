@@ -15,7 +15,6 @@ exactly the same so CLI and TUI need no changes.
 from __future__ import annotations
 
 import asyncio
-import fnmatch
 import json
 import os
 import re
@@ -210,15 +209,85 @@ def _build_tools(allowed: list[str]) -> list[dict] | None:
 _BASH_TIMEOUT = 60          # seconds
 _TOOL_TIMEOUT = 10          # seconds for Read/Write/Glob/Grep
 _MAX_OUTPUT = 8192          # chars
+
+# Shell metacharacters that enable chaining and substitution.
+# `&`, `|`, `;`, backtick and `$(` all start a SECOND command; one Bash call
+# is one command. Redirection (>, <) is permitted — the agent legitimately
+# writes files that way — but the redirect TARGET is containment-checked below.
+_SHELL_CHAIN_CHARS = ("&", "|", ";", "`", "$", "\n")
+
+# Commands that can destroy data or alter system state. Each target argument
+# is checked against the workspace boundary rather than pattern-matched.
+_DESTRUCTIVE_CMDS = frozenset({
+    "rm", "rmdir", "shred", "mkfs", "mkfs.ext4", "fdisk", "diskutil",
+    "dd", "truncate", "chmod", "chown", "chgrp", "unlink",
+})
+
+# Absolute paths that are never a legal target regardless of the workspace.
+# Home directories (/Users, /home, /root) are deliberately NOT listed: the
+# workspace usually lives inside one, and listing it would deny the agent's
+# own project directory. The boundary rule in _is_inside_workspace covers them.
+_SYSTEM_TARGETS = (
+    "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/opt", "/private/etc",
+    "/proc", "/sbin", "/System", "/usr", "/var/db", "/var/log", "/var/root",
+    "/Applications", "/Library", "/Volumes",
+)
+
+# Inline interpreter code (-c / -e) can express any destruction the list above
+# blocks. These catch the common forms without parsing a whole language.
+_INLINE_DESTRUCTION = [
+    r"\brmtree\b",
+    r"\bunlink\b",
+    r"\bsend2trash\b",
+    r"\bos\s*\.\s*remove\s*\(",
+    r"\bos\s*\.\s*rmdir\s*\(",
+    r"\bos\s*\.\s*removedirs\s*\(",
+    r"\bsystem\s*\(\s*['\"]\s*rm\b",
+    r"\bpopen\s*\(",
+    r"\btruncate\s*\(\s*['\"]?/",
+    r"\bopen\s*\(\s*['\"]/[^'\"]*['\"]\s*,\s*['\"]w",
+]
+_INTERPRETERS = frozenset({"python", "python3", "perl", "ruby", "node", "sh", "bash", "zsh"})
+
+# The subset that takes a SHELL command string via -c. Only these payloads are
+# re-judged by _deny_reason: in Python/Perl/Ruby, ';' separates statements and
+# re-applying shell rules would reject ordinary analysis code.
+_SHELL_INTERPRETERS = frozenset({"sh", "bash", "zsh"})
+
+# Commands that run some OTHER command as their next token, so the real payload
+# is that token. "env rm -rf /" must be judged exactly as "rm -rf /" is.
+# xargs is deliberately NOT here: it APPENDS stdin arguments to the command
+# rather than passing them through, so "unwrap one token" is the wrong model.
+# There is no legitimate use for it in this agent, so it is denied outright.
+_WRAPPER_CMDS = frozenset({
+    "env", "sudo", "command", "nohup", "time", "stdbuf", "nice", "ionice", "exec",
+})
+
+# `make` is not itself destructive, but these targets wipe build trees. Blocking
+# all of `make` would break ordinary builds, so only the deleting targets go.
+_DESTRUCTIVE_MAKE_TARGETS = frozenset({"clean", "distclean", "realclean"})
+
+# Turns a file list into arguments for an arbitrary command. No legitimate use
+# in this agent, and it cannot be modelled by unwrapping a single token.
+_DENIED_CMDS = frozenset({"xargs"})
+
+# Ruby / Node / Perl destruction spellings, for the same reason as _INLINE_DESTRUCTION.
+_SCRIPTED_DESTRUCTION = [
+    r"\brm_rf\b", r"\brm_r\b", r"\brmSync\b", r"\brmdirSync\b",
+    r"\bunlink\b", r"\bFileUtils\b", r"\bDir\s*\.\s*rm\b",
+]
+
+# Command-line patterns that have no legitimate use here and are always denied.
+# Kept as regexes because these are about command *shape*, not target path.
 _FORBIDDEN_PATTERNS = [
-    r"\brm\s+-rf\s*/\b",
     r"\bmkfs\b",
     r"\bdd\s+if=",
-    r"\bchmod\s+-R\s+777\s*/\b",
-    r"\>:dev:null\b",        # obfuscated /dev/null writes
-    r"\bcurl\s+.*\|\s*sh\b",
-    r"\bwget\s+.*\|\s*sh\b",
-    r"\bbase64\s+-d\s*\|\s*sh\b",
+    r"\bfind\b[^|;&]*\s-delete\b",       # find / -delete
+    r"\bfind\b[^|;&]*\s-exec\s+(rm|shred|unlink)",  # find / -exec rm {} +
+    r"\bgit\s+clean\b[^|;&]*-[a-z]*f",  # git clean -fdx
+    r"\bcurl\b[^|;&]*\|\s*(ba)?sh\b",
+    r"\bwget\b[^|;&]*\|\s*(ba)?sh\b",
+    r"\bbase64\s+-d\b[^|;&]*\|\s*(ba)?sh\b",
     r"\beval\s*\(",
 ]
 
@@ -238,15 +307,153 @@ def _safe_resolve(path_str: str) -> Path:
     return p
 
 
-def _bash(command: str) -> str:
-    """Run a shell command safely. Returns stdout or error text."""
+def _is_inside_workspace(target: Path) -> bool:
+    """True if `target` is strictly below the working directory.
+
+    Strictly: the workspace root itself is NOT inside itself, so a destructive
+    command aimed at the root (rm -rf .) is denied along with one aimed outside.
+    """
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        return False
+    return cwd in target.parents
+
+
+def _deny_reason(command: str) -> str | None:
+    """Return a human-readable reason if `command` is denied, else None.
+
+    Layered, cheapest first:
+      1. shape patterns  — command shape (piped install, find -delete, ...)
+      2. chaining        — no `&&`, `;`, `|`, backtick or `$(`
+      3. target boundary — destructive commands may only touch the workspace
+
+    Why boundaries rather than a command denylist: with shell=True the shell
+    expands `~`, `$HOME` and globs BEFORE any per-command check can inspect
+    the result, so no list of forbidden commands can be made complete. A
+    destructive command aimed outside the working directory is denied whatever
+    its name, and naming interpreters lets inline code be checked too.
+    """
+    # 1. shape
     for pat in _FORBIDDEN_PATTERNS:
         if re.search(pat, command, re.IGNORECASE):
-            return f"[ToolError] Forbidden pattern detected. Re-think the command."
+            return "Forbidden pattern detected. Re-think the command."
 
-    if command.strip().startswith(("python -c ", "python3 -c ")):
-        # Simple one-liner — accept
-        pass
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return "Could not parse command. Re-think the syntax."
+
+    # 2. chaining / substitution — only OUTSIDE quotes, so legitimate inline
+    #    code such as python -c 'a and b' is not caught.
+    bare = re.sub(r"'[^']*'|\"[^\"]*\"", " ", command)
+    for ch in _SHELL_CHAIN_CHARS:
+        if ch in bare:
+            if ch == "$":
+                return (
+                    "Variable expansion is not allowed. A path like $HOME is "
+                    "resolved by the shell, so it cannot be verified here — "
+                    "write the literal path instead."
+                )
+            return (
+                f"Shell metacharacter {ch!r} is not allowed. "
+                "Run a single command; do not chain or pipe."
+            )
+
+    if not parts:
+        return None
+
+    head = Path(parts[0]).name
+
+    # 0. unwrap wrapper commands: "env rm -rf /" is judged as "rm -rf /".
+    #    Each wrapper takes options of its own before the real command, so skip
+    #    any leading flags — otherwise "env -i rm -rf /" would judge "-i" as the
+    #    command and let "rm -rf /" through unexamined.
+    #    Bounded to a few levels so `env env env ...` cannot spin.
+    for _ in range(4):
+        if head not in _WRAPPER_CMDS or len(parts) < 2:
+            break
+        rest = parts[1:]
+        # `sudo -u root cmd` — the flag's value is a separate token, so skip both.
+        idx = 0
+        while idx < len(rest) and rest[idx].startswith("-"):
+            idx += 1
+            if head == "sudo" and rest[idx - 1] in ("-u", "-g", "-U", "-C", "-p", "-r", "-t"):
+                idx += 1  # this flag takes a value
+        if idx >= len(rest):
+            break
+        parts = rest[idx:]
+        head = Path(parts[0]).name
+
+    # 0c. commands with no legitimate use here, whatever their arguments.
+    if head in _DENIED_CMDS:
+        return f"{head!r} is not available in this environment."
+
+    # 0b. `sh -c '<command>'` runs its quoted argument as a shell command, so
+    #     judge that payload with this same policy rather than regex-scanning it.
+    if head in _SHELL_INTERPRETERS and len(parts) >= 3 and parts[1] in ("-c",):
+        payload = parts[2]
+        if payload and payload != command:
+            nested = _deny_reason(payload)
+            if nested is not None:
+                return f"Inner command denied — {nested}"
+
+    # 3a. inline interpreter code
+    if head in _INTERPRETERS:
+        for pat in _INLINE_DESTRUCTION + _SCRIPTED_DESTRUCTION:
+            if re.search(pat, command):
+                return (
+                    f"Inline code from {head!r} contains a destructive call. "
+                    "Run a single, explicit file operation instead."
+                )
+
+    # 3b. destructive command targets
+    if head in _DESTRUCTIVE_CMDS:
+        for arg in parts[1:]:
+            if arg.startswith("-"):
+                continue
+            # "/" and "/*" are the root — always denied, never inside a workspace.
+            if arg.rstrip("*").rstrip("/") == "":
+                return (
+                    f"Refusing to run {head!r} against the filesystem root."
+                )
+            try:
+                resolved = Path(arg).expanduser().resolve()
+            except (OSError, RuntimeError):
+                continue
+            if not _is_inside_workspace(resolved):
+                return (
+                    f"Refusing to run {head!r} against {resolved}: "
+                    "outside the working directory."
+                )
+            for prot in _SYSTEM_TARGETS:
+                if resolved == Path(prot) or Path(prot) in resolved.parents:
+                    return (
+                        f"Refusing to run {head!r} against protected "
+                        f"target {resolved}."
+                    )
+
+    # 3c. build systems that delete on request. `make` itself is fine, so only
+    # the deleting targets are denied — blocking all of `make` would break
+    # ordinary builds, which this agent legitimately runs.
+    if head == "make":
+        for arg in parts[1:]:
+            if arg.startswith("-"):
+                continue
+            target = arg.split("=", 1)[0]
+            if target in _DESTRUCTIVE_MAKE_TARGETS:
+                return (
+                    f"'make {target}' deletes build output. "
+                    "Remove the specific paths instead."
+                )
+    return None
+
+
+def _bash(command: str) -> str:
+    """Run a single shell command safely. Returns stdout or error text."""
+    reason = _deny_reason(command)
+    if reason is not None:
+        return f"[ToolError] {reason}"
 
     try:
         result = subprocess.run(
