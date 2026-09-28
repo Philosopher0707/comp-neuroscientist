@@ -83,6 +83,15 @@ class ClaudeAgentOptions:
     allowed_tools: List[str] = field(default_factory=list)
     agents: dict = field(default_factory=dict)
     system_prompt: Optional[str] = None
+    # Endpoint and credential, resolved by the caller (Config) and passed in
+    # explicitly. The SDK deliberately does NOT read ANTHROPIC_BASE_URL or any
+    # other environment variable: ambient env is invisible to callers, untested,
+    # and was the mechanism by which `--local` could be silently routed off-host.
+    # env_fallback=True restores the legacy env-reading behaviour for callers
+    # that have not yet threaded a value through.
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    env_fallback: bool = True
 
 
 @dataclass
@@ -643,28 +652,122 @@ def _deny_reason(command: str) -> str | None:
 
 
 def _bash(command: str) -> str:
-    """Run a single shell command safely. Returns stdout or error text."""
+    """Run a single shell command safely. Returns stdout or error text.
+
+    Execution is argv-based (`shell=False`), not `shell=True`. The denylist above
+    is defence in depth, but a denylist over shell metacharacters is a losing
+    bet: it enumerates spellings, and a shell expands things the filter never
+    saw. The primary boundary is that the command string is tokenised once,
+    verified, and handed to the OS as a literal argv — there is no shell left to
+    reinterpret it, so the metacharacters the denylist reasons about cannot
+    combine into a second command.
+
+    Redirection (`>`, `<`) is the one shell feature the agent legitimately
+    needs, and it is handled explicitly below rather than by handing the string
+    to a shell.
+    """
     reason = _deny_reason(command)
     if reason is not None:
         return f"[ToolError] {reason}"
 
+    argv, redirects, err = _parse_argv(command)
+    if err is not None:
+        return f"[ToolError] {err}"
+
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=_BASH_TIMEOUT,
-            cwd=str(Path.cwd()),
-        )
-        out = (result.stdout or "") + (result.stderr or "")
-        if result.returncode != 0:
-            out = f"[exit {result.returncode}] " + out
+        # Shell semantics: `>` and `>>` BOTH redirect stdout. `>>` differs only
+        # in that it appends instead of truncating. Neither touches stderr.
+        # (An earlier draft wired `>>` to stderr, which silently discarded the
+        # output while still reporting success to the caller.)
+        trunc_path = _open_redirect(redirects.get(">"), "wb")
+        append_path = _open_redirect(redirects.get(">>"), "ab")
+        try:
+            # NOTE: `capture_output=True` is deliberately absent. It is
+            # mutually exclusive with explicit stdout/stderr in subprocess.run
+            # and raises ValueError if both are given. We must pass them
+            # explicitly because a redirect replaces one of them.
+            result = subprocess.run(
+                argv,
+                shell=False,  # argv is a list; no shell is ever spawned
+                text=True,
+                timeout=_BASH_TIMEOUT,
+                cwd=str(Path.cwd()),
+                stdout=trunc_path or append_path or subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        finally:
+            for handle in (trunc_path, append_path):
+                if handle is not None:
+                    handle.close()
+
+        if (trunc_path or append_path) is not None:
+            # stdout went to a file, not to us; stderr may still be non-empty.
+            file_target = redirects.get(">") or redirects.get(">>")
+            out = (result.stderr or "").strip()
+            prefix = f"[exit {result.returncode}] Output written to {file_target}"
+            out = f"{prefix}\n{out}" if out else prefix
+        else:
+            out = (result.stdout or "") + (result.stderr or "")
+            if result.returncode != 0:
+                out = f"[exit {result.returncode}] " + out
         return out[:_MAX_OUTPUT]
     except subprocess.TimeoutExpired:
         return f"[ToolError] Command timed out after {_BASH_TIMEOUT}s"
+    except FileNotFoundError:
+        return f"[ToolError] Command not found: {argv[0]}"
     except Exception as exc:
         return f"[ToolError] {type(exc).__name__}: {exc}"
+
+
+def _parse_argv(command: str) -> tuple[list[str] | None, dict[str, str], str | None]:
+    """Tokenise a command into argv plus any redirection targets.
+
+    Redirection is the only shell syntax still honoured, so it is split out here
+    rather than being left to a shell. Returns (argv, redirects, error_message).
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None, {}, "Could not parse command. Re-think the syntax."
+
+    if not parts:
+        return None, {}, "Empty command."
+
+    redirects: dict[str, str] = {}
+    argv: list[str] = []
+    i = 0
+    while i < len(parts):
+        tok = parts[i]
+        if tok in (">", ">>"):
+            if i + 1 >= len(parts):
+                return None, {}, f"Redirection {tok!r} has no target."
+            target = parts[i + 1]
+            # The redirect target is a write, so it faces the same boundary as
+            # any other write: `cmd > /etc/sudoers.d/x` must not be a way out.
+            if _is_protected_target(Path(target).expanduser(), write=True) is not None:
+                return None, {}, (
+                    f"Refusing to redirect output to {target!r}: that path is "
+                    f"protected."
+                )
+            redirects[tok] = target
+            i += 2
+            continue
+        argv.append(tok)
+        i += 1
+
+    if not argv:
+        return None, {}, "Empty command."
+    return argv, redirects, None
+
+
+def _open_redirect(target: str | None, mode: str):
+    """Open a redirect target for writing, or return None when unused."""
+    if target is None:
+        return None
+    try:
+        return open(target, mode)
+    except OSError as exc:
+        raise OSError(f"cannot open redirect target {target!r}: {exc}") from exc
 
 
 def _read(file_path: str) -> str:
@@ -764,13 +867,25 @@ async def _run_agent_loop(
     """Multi-turn agent loop with streaming + tool execution."""
     from openai import OpenAI, APIError, APIConnectionError
 
-    api_key = (
-        os.environ.get("ANTHROPIC_API_KEY", "")
-        or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
-        or "ollama"
-    )
-    base_url = os.environ.get("ANTHROPIC_BASE_URL", "http://localhost:11434")
-    base_url = base_url.rstrip("/")
+    # Endpoint resolution: explicit options win, env is only a fallback for
+    # callers that have not opted into explicit passing.
+    if options.base_url:
+        base_url = options.base_url.rstrip("/")
+        api_key = options.api_key or "ollama"
+    elif options.env_fallback:
+        api_key = (
+            os.environ.get("ANTHROPIC_API_KEY", "")
+            or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+            or "ollama"
+        )
+        base_url = os.environ.get("ANTHROPIC_BASE_URL", "http://localhost:11434")
+        base_url = base_url.rstrip("/")
+    else:
+        # Fail closed: no endpoint was supplied and env reading is disabled.
+        raise ValueError(
+            "No API endpoint configured. Pass ClaudeAgentOptions.base_url "
+            "(e.g. from Config.resolved_base_url) or set env_fallback=True."
+        )
     if not base_url.endswith("/v1"):
         base_url = f"{base_url}/v1"
 

@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from claude_agent_sdk import _deny_reason  # noqa: E402
+from claude_agent_sdk import _bash, _deny_reason  # noqa: E402
 
 
 # ─── the canonical catastrophic command ────────────────────────
@@ -365,3 +365,101 @@ def test_moves_within_policy_still_allowed(cmd):
 # protection added above cannot be mistaken for an over-block.
 def test_rm_of_autostart_dir_denied():
     assert _deny_reason("rm -rf ~/Library/LaunchAgents") is not None
+
+
+# ═══ EXECUTION ══════════════════════════════════════════════════
+# The tests above all call `_deny_reason`, which only exercises the filter.
+# They pass even when `_bash` itself is completely broken — and it was: a draft
+# passed `capture_output=True` alongside explicit stdout/stderr, so every real
+# command returned a swallowed ValueError. These call `_bash` for real.
+
+def test_bash_executes_and_returns_stdout():
+    assert _bash("echo hello") == "hello\n"
+
+
+def test_bash_reports_nonzero_exit():
+    out = _bash("ls /definitely_not_here_zzz")
+    assert out.startswith("[exit 1]"), out
+
+
+def test_bash_reports_missing_binary():
+    out = _bash("definitely_not_a_real_binary_xyz")
+    assert "Command not found" in out, out
+
+
+def test_bash_denied_command_does_not_execute(tmp_path):
+    """A denied command must not run at all — not merely have its output hidden.
+
+    `touch` is deliberately NOT used here: it is not on the denylist, so it
+    runs. The marker directory is a real rm target instead — if the denylist
+    were advisory rather than enforced, this directory would be destroyed.
+    """
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("intact")
+
+    out = _bash("rm -rf " + str(victim))
+
+    assert out.startswith("[ToolError]"), out
+    assert victim.exists() and (victim / "keep.txt").read_text() == "intact"
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo a ; echo b",
+    "echo a && echo b",
+    "echo a | cat",
+    "echo $HOME",
+    "echo `whoami`",
+])
+def test_bash_metacharacters_refused_at_execution(cmd):
+    assert _bash(cmd).startswith("[ToolError]"), cmd
+
+
+# ─── redirection ────────────────────────────────────────────────
+# Regression witness: an earlier draft wired `>>` to *stderr*, so the command
+# appeared to succeed, the caller got the text back, and the file was left
+# missing that output entirely. Silent data loss with a success return value.
+
+def test_bash_redirect_truncates_and_writes_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _bash("echo first > log.txt")
+    assert (tmp_path / "log.txt").read_text() == "first\n"
+
+
+def test_bash_append_redirect_appends_to_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _bash("echo first > log.txt")
+    _bash("echo second >> log.txt")
+    assert (tmp_path / "log.txt").read_text() == "first\nsecond\n"
+
+
+def test_bash_truncating_redirect_overwrites(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _bash("echo old > log.txt")
+    _bash("echo new > log.txt")
+    assert (tmp_path / "log.txt").read_text() == "new\n"
+
+
+def test_bash_redirect_target_is_not_also_returned_as_output(tmp_path, monkeypatch):
+    """stdout went to the file, so it must not also be returned as text.
+
+    The payload is deliberately NOT the word "written", which appears in the
+    "Output written to" status line and would make this a false failure.
+    """
+    monkeypatch.chdir(tmp_path)
+    out = _bash("echo payload_xyz123 > log.txt")
+    assert "payload_xyz123" not in out, out
+    assert (tmp_path / "log.txt").read_text() == "payload_xyz123\n"
+
+
+def test_bash_redirect_without_target_refused(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    out = _bash("echo x >")
+    assert out.startswith("[ToolError]"), out
+    assert not (tmp_path / ">").exists()
+
+
+def test_bash_redirect_to_protected_path_refused():
+    out = _bash("echo pwned > /etc/sudoers.d/x")
+    assert out.startswith("[ToolError]"), out
+    assert "protected" in out.lower(), out

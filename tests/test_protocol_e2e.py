@@ -51,9 +51,20 @@ def _run_agent(
     """
     srv = FakeOpenAIServer(script).start()
     env = dict(os.environ)
+    # Point Config at the fake server, NOT the ambient ANTHROPIC_BASE_URL.
+    # Config is the single authority for the endpoint (see config.py); the SDK
+    # takes the URL from ClaudeAgentOptions.base_url and never reads env. The
+    # test must therefore steer the same knob the agent reads, or it would point
+    # at a real endpoint and the run would depend on the developer's shell.
+    env["OLLAMA_BASE_URL"] = srv.base_url
     env["ANTHROPIC_BASE_URL"] = srv.base_url
     env["ANTHROPIC_API_KEY"] = "test-key"
     env["PYTHONPATH"] = str(SRC)
+    # The developer's shell may export CN_LOCAL / CN_MODEL; a local+cloud
+    # combination now fails closed by design, which would make these protocol
+    # tests fail for reasons unrelated to the protocol. Pin them explicitly.
+    env["CN_LOCAL"] = "false"
+    env["CN_MODEL"] = "test-model"
     # Keep the run hermetic: no real writes into the developer's output dirs.
     # The agent writes a report.md into CN_OUTPUT_DIR, so this must point
     # somewhere disposable. Callers pass pytest's tmp_path; the tempfile
