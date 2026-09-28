@@ -9,11 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import sys
-import time
 from pathlib import Path
-from typing import AsyncIterator, List, Optional
+from typing import AsyncIterator, List
 
 from claude_agent_sdk import (
     query,
@@ -21,6 +19,8 @@ from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
     TextBlock,
+    ToolUseMessage,
+    ToolResultMessage,
 )
 
 from .config import config
@@ -64,8 +64,6 @@ def consume_stream(
     In JSON mode: writes JSON events to stdout for the Go TUI to consume.
     """
     collected: List[str] = []
-    result_status = "running"
-    turns = 0
 
     try:
         while True:
@@ -86,16 +84,29 @@ def consume_stream(
                 if msg.model:
                     pass  # model info available
 
+            elif isinstance(msg, ToolUseMessage):
+                if json_mode:
+                    _emit_json({"type": "status", "status": "running", "turns": msg.turn})
+                    _emit_json({
+                        "type": "tool_call",
+                        "name": msg.name,
+                        "arguments": msg.arguments,
+                    })
+
+            elif isinstance(msg, ToolResultMessage):
+                if json_mode:
+                    _emit_json({
+                        "type": "tool_result",
+                        "name": msg.name,
+                        "result": msg.result,
+                    })
+
             elif isinstance(msg, ResultMessage):
-                turns = msg.num_turns
                 if msg.is_error:
-                    result_status = "error"
                     if json_mode:
                         _emit_json({"type": "error", "message": msg.errors})
                     else:
                         print(f"\n\n[Error: {msg.errors}]", flush=True)
-                else:
-                    result_status = "success"
 
                 if json_mode:
                     _emit_json({
@@ -110,13 +121,11 @@ def consume_stream(
                           flush=True)
 
     except KeyboardInterrupt:
-        result_status = "interrupted"
         if json_mode:
             _emit_json({"type": "error", "message": "interrupted"})
         print("\n[Interrupted]", flush=True)
 
     except Exception as exc:
-        result_status = "error"
         if json_mode:
             _emit_json({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
         print(f"\n[Unexpected error: {type(exc).__name__}: {exc}]", flush=True)
@@ -133,17 +142,23 @@ def _emit_json(obj: dict) -> None:
 # ─── Setup environment ─────────────────────────────────────────
 
 def _setup_environment(prompt: str) -> ClaudeAgentOptions:
-    """Configure the agent options from config and the prompt's domain."""
-    # Determine which agents might be relevant based on keywords in the prompt
-    relevant_agents: dict = {}
-    prompt_lower = prompt.lower()
+    """Configure the agent options from config.
 
-    # Always include all agents — the orchestrator decides when to use them
-    relevant_agents = dict(ALL_SUBAGENTS)
+    Args:
+        prompt: The user's prompt. Used to select which subagents and tools are
+            exposed — see `_select_relevant_agents`.
 
-    # Collect tool names from all subagents
+    Exposing every subagent and the union of every subagent's tools on every run
+    was a real but blunt over-grant: a prompt about EEG preprocessing had the
+    same tool surface as one that would train encoders and run simulations. Tool
+    surface is now scoped to the prompt's actual subject matter.
+    """
+    relevant_agents = _select_relevant_agents(prompt)
+
+    # Tool surface = tools of the SELECTED agents, not of all agents. Base tools
+    # are always present because every task needs to read and write results.
     all_tools: set[str] = set()
-    for agent_def in ALL_SUBAGENTS.values():
+    for agent_def in relevant_agents.values():
         all_tools.update(agent_def.tools)
     # Base tools
     all_tools.update(["Bash", "Read", "Write", "Glob", "Grep"])
@@ -154,8 +169,83 @@ def _setup_environment(prompt: str) -> ClaudeAgentOptions:
         allowed_tools=sorted(all_tools),
         agents=relevant_agents,
         system_prompt=SYSTEM_PROMPT,
+        # Config is the single authority for the endpoint. Passing it explicitly
+        # means ambient ANTHROPIC_BASE_URL can no longer override --local.
+        base_url=config.resolved_base_url,
+        api_key=config.api_key,
     )
 
+
+def _select_relevant_agents(prompt: str) -> dict:
+    """Pick the subagents a prompt could plausibly need.
+
+    Selection is keyword-based and deliberately conservative in the safe
+    direction: an unrecognised prompt falls back to ALL subagents, so scoping
+    never removes a capability the model genuinely needed. The benefit is that a
+    clearly-scoped prompt no longer advertises every specialist, which both
+    narrows the tool surface and stops the model from delegating to an
+    irrelevant specialist.
+    """
+    if not prompt or not prompt.strip():
+        return dict(ALL_SUBAGENTS)
+
+    text = prompt.lower()
+    matched = {
+        name: agent_def
+        for name, agent_def in ALL_SUBAGENTS.items()
+        if any(kw in text for kw in _AGENT_KEYWORDS.get(name, ()))
+    }
+    return matched or dict(ALL_SUBAGENTS)
+
+
+# ─── Subagent routing ────────────────────────────────────────────
+
+# Keyword → subagent triggers. Used to scope the exposed subagent and tool set
+# to the prompt. Keys must match ALL_SUBAGENTS. Matching is substring-based on
+# the lowercased prompt, so entries should be unambiguous enough that a
+# substring hit means the domain is genuinely in play.
+_AGENT_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "fmri": ("fmri", "bold", "mri", "glm", "connectom", "resting-state",
+             "resting state", "task-based", "rois", "surface plot",
+             "glass brain", "searchlight", "bids", "realign", "smooth"),
+    "eeg": ("eeg", "erp", "erp", "meg", "eog", "artifact", "ica",
+            "time-frequency", "time frequency", "tfr", "evoked",
+            "seizure", "spindle", "montage", "electrode", "channel"),
+    "ephys": ("ephys", "electrophysiolog", "patch clamp", "whole-cell",
+              "spike train", "voltage clamp", "current clamp", "nanogap",
+              "intracellular", "membrane potential", "vhold"),
+    "encoding": ("encoding", "decoding", "mvpa", "rsa", "representational",
+                 "similarity", "noise ceiling", "voxel", "ridge", "voxelwise",
+                 "model comparison", "receptive field"),
+    "simulation": ("simulat", "spiking", "lif", "leaky integrate",
+                   "stdp", "plasticity", "raster", "population rate",
+                   "mean-field", "mean field", "lfp", "snn", "neuron model",
+                   "tuning curve"),
+    "calcium": ("calcium", "caiman", "suite2p", "two-photon", "2p",
+                "gcamp", "neuropil", "oasis", "deconvolution", "calcium trace",
+                "cell sorting", "fluorescence"),
+    "stats": ("statistic", "statistical", "p-value", "p value", "ttest",
+              "t-test", "anova", "mixed-effects", "mixed effects",
+              "multiple comparison", "correction", "fdr", "bonferroni",
+              "permutation test", "bootstrap", "confidence interval",
+              "effect size", "power analysis", "shuffl"),
+    "ml": ("machine learning", "classifier", "classification", "svm",
+           "logistic regression", "random forest", "gradient boost",
+           "xgboost", "sklearn", "scikit", "cross-validation",
+           "cross validation", "hyperparameter", "pca", "cca", "umap",
+           "autoencoder", "dimensionality reduction", "confusion matrix",
+           "roc", "precision", "recall", "f1", "leave-one-subject-out",
+           "model training", "fine-tune", "fine tune", "network"),
+}
+
+# Guard against drift: a subagent with no keyword entry can never be selected,
+# which would be a silent capability loss. Keys are checked against
+# ALL_SUBAGENTS at import time so adding an agent without keywords fails loudly.
+assert set(_AGENT_KEYWORDS) == set(ALL_SUBAGENTS), (
+    "_AGENT_KEYWORDS must cover every subagent exactly once; "
+    f"missing={sorted(set(ALL_SUBAGENTS) - set(_AGENT_KEYWORDS))}, "
+    f"stale={sorted(set(_AGENT_KEYWORDS) - set(ALL_SUBAGENTS))}"
+)
 
 # ─── Entry point ────────────────────────────────────────────────
 
@@ -175,9 +265,11 @@ def run_agent(prompt: str, json_mode: bool = False) -> str:
 
     options = _setup_environment(prompt)
 
-    # Set env vars for the agent SDK
-    os.environ.setdefault("ANTHROPIC_AUTH_TOKEN", "ollama")
-    os.environ.setdefault("ANTHROPIC_BASE_URL", config.ollama_url)
+    # The endpoint is carried on `options` (see `_setup_environment`). It is
+    # deliberately NOT written into os.environ: mutating the process
+    # environment is what made routing invisible and untestable, and any
+    # ANTHROPIC_BASE_URL already in the caller's shell would otherwise win.
+    # os.environ is untouched from here on.
 
     stream = query(prompt, options)
     result_text = consume_stream(stream, json_mode=json_mode)

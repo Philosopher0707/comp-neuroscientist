@@ -36,6 +36,12 @@ func TestParseResultEvent(t *testing.T) {
 	if ev.IsError {
 		t.Fatal("expected is_error=false")
 	}
+	// The final answer travels on the "text" key. Asserting it here is what
+	// catches the struct silently dropping that field — the bug this test
+	// previously sat next to without noticing.
+	if ev.Text != "done" {
+		t.Fatalf("expected final answer 'done', got '%s'", ev.Text)
+	}
 }
 
 func TestParseErrorEvent(t *testing.T) {

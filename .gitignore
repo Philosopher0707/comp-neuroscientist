@@ -9,3 +9,18 @@ results/
 *.egg-info/
 dist/
 build/
+
+# Compiled Go TUI binary. `scripts/run.sh` and the README both build it from
+# source, so there is no reason to track a 6 MB machine-specific executable.
+bin/
+
+# Default `go build ./...` output inside the tui module.
+tui/tui
+
+# Agent scratch/log directories (not project source).
+.agent/
+.wisp/
+.forensics/
+
+# Scratch logs dropped by agent tooling at various paths.
+*.revert.log

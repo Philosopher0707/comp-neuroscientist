@@ -8,7 +8,7 @@ Built on a custom Python agent loop (OpenAI SDK → Ollama) with a Go terminal U
 
 ### 1. Requirements
 
-- Python 3.13+
+- Python 3.11+
 - Go 1.26+ (for the TUI)
 - [Ollama](https://ollama.com/) v0.14.0+ running on port 11434
 - The `compneuro-toolkit` library (install from source in `/Users/philosopher/research/compneuro-toolkit`)

@@ -75,7 +75,10 @@ EPHYS_AGENT = AgentDefinition(
 - PSTH, tuning curves, and cross-correlograms
 - LFP analysis (spectral, phase-amplitude coupling)
 - Single-unit and multi-unit analysis
-Requires: spikeinterface, pynapple, or compneuro.ephys module.""",
+Requires: compneuro.ephys, which itself requires pynapple. If `import pynapple`
+raises ModuleNotFoundError, STOP and tell the user to `pip install pynapple
+spikeinterface` — do not improvise a substitute, and do not claim to have
+analysed a recording you could not load.""",
     prompt="""You are an expert electrophysiology / spike sorting analyst.
 
 Your workflow:

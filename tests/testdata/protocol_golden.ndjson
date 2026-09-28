@@ -1,0 +1,8 @@
+{"status": "running", "turns": 1, "type": "status"}
+{"arguments": {"content": "x", "file_path": "<tests>/testdata/golden_probe.txt"}, "name": "Write", "type": "tool_call"}
+{"name": "Write", "result": "[ok] Wrote 1 chars to <tests>/testdata/golden_probe.txt", "type": "tool_result"}
+{"content": "Analys", "type": "text"}
+{"content": "is com", "type": "text"}
+{"content": "plete.", "type": "text"}
+{"duration_ms": 111, "is_error": false, "text": "Analysis complete.", "turns": 2, "type": "result"}
+{"message": "API connection failed", "type": "error"}

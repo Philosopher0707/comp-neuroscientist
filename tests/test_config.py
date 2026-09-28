@@ -15,12 +15,16 @@ def test_default_local_model(monkeypatch):
     assert c.model == "llama3.1"
 
 
-def test_local_flag_overrides_env_model(monkeypatch):
-    """CN_MODEL takes precedence over CN_LOCAL."""
+def test_env_model_overrides_local_default(monkeypatch):
+    """CN_MODEL still wins for model SELECTION, even under CN_LOCAL.
+
+    Precedence between the two env vars is unchanged and is kept as a witness:
+    an explicit CN_MODEL is not silently overwritten by the local default.
+    """
     monkeypatch.setenv("CN_LOCAL", "1")
-    monkeypatch.setenv("CN_MODEL", "glm-5.1:cloud")
+    monkeypatch.setenv("CN_MODEL", "qwen2.5:7b")
     c = Config()
-    assert c.model == "glm-5.1:cloud"
+    assert c.model == "qwen2.5:7b"
 
 
 def test_local_default_false():
