@@ -5,7 +5,7 @@
 Autonomous computational neuroscience agent. Describe an analysis task in natural language; the agent loads data, runs analysis pipelines (fMRI, EEG, ephys, calcium, encoding, simulation), and produces a report.
 
 **Stack:**
-- Python 3.13+ (agent core, ML/neuro stack)
+- Python 3.11+ (agent core, ML/neuro stack)
 - Go 1.26+ (TUI via Charm Bubble Tea)
 - Ollama (model inference)
 
@@ -61,8 +61,6 @@ cd tui && go build -o ../bin/comp-neuro-tui . && ../bin/comp-neuro-tui
 ### Run CLI
 ```bash
 PYTHONPATH=src \
-ANTHROPIC_AUTH_TOKEN=ollama \
-ANTHROPIC_BASE_URL=http://localhost:11434 \
   python -m comp_neuroscientist.cli "Load BOLD data and compute connectivity"
 ```
 
@@ -78,9 +76,10 @@ cd tui && go test ./... -v
 ## Critical Rules
 
 - **Never use litellm** — Ollama natively supports OpenAI-compatible API
-- **Always set** `ANTHROPIC_AUTH_TOKEN=ollama` and `ANTHROPIC_BASE_URL` before running the CLI
+- **Never set `ANTHROPIC_BASE_URL`** — the CLI and TUI never route on it. The endpoint comes from `Config.ollama_url`, which reads `OLLAMA_BASE_URL` (default `http://localhost:11434`). `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` are consulted only as a credential fallback in non-local mode; they never route traffic. (The SDK still has a legacy `env_fallback=True` branch that reads it, but that branch is unreachable from the CLI/TUI: both always pass `base_url` explicitly.)
 - **Never modify tool schemas** without updating `_build_tools()` in `claude_agent_sdk.py`
 - **JSON protocol is append-only** — each event is exactly one line of JSON
+- **Config is the single endpoint authority** — every CLI/TUI run passes `ClaudeAgentOptions.base_url` explicitly, so the SDK's `if options.base_url:` branch always wins and ambient env cannot route traffic. This is what makes `CN_LOCAL` un-defeatable by a pre-existing `ANTHROPIC_BASE_URL`.
 
 ## Dependencies
 

@@ -31,10 +31,14 @@ cd tui && go build -o ../bin/comp-neuro-tui . && cd ..
 **CLI mode:**
 ```bash
 PYTHONPATH=src \
-ANTHROPIC_AUTH_TOKEN=ollama \
-ANTHROPIC_BASE_URL=http://localhost:11434 \
   python -m comp_neuroscientist.cli "Load BOLD data and compute functional connectivity"
 ```
+
+The endpoint comes from `Config`, not from ambient environment variables — see
+[Configuration](#configuration). `ANTHROPIC_BASE_URL` is **never read for routing
+on the CLI/TUI path** (the endpoint is always passed to the SDK explicitly);
+`ANTHROPIC_AUTH_TOKEN` is read only as a *credential* fallback in non-local mode.
+Setting either one for routing purposes is a no-op.
 
 **TUI mode:**
 ```bash
@@ -90,11 +94,13 @@ The TUI is powered by [Bubble Tea](https://github.com/charmbracelet/bubbletea) (
 
 | Env var | Flag | Default | Description |
 |---|---|---|---|
-| `CN_MODEL` | `--model` | `deepseek-v4-flash:cloud` | Ollama model |
-| `OLLAMA_BASE_URL` | — | `http://localhost:11434` | Ollama server |
+| `CN_MODEL` | `--model` | `deepseek-v4-flash:cloud` (or `llama3.1` if `CN_LOCAL`) | Ollama model |
+| `OLLAMA_BASE_URL` | — | `http://localhost:11434` | Ollama server — **the only** endpoint authority |
+| `CN_LOCAL` | — | unset (cloud) | `1`/`true`/`yes` forces local-only: loopback endpoint + `llama3.1` default |
 | `CN_MAX_TURNS` | `--max-turns` | `30` | Max agent iterations |
 | `CN_EFFORT` | — | `high` | Effort level |
 | `CN_OUTPUT_DIR` | `--output` | `results` | Output directory |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | — | — | Credential fallback for **non-local** mode only. Never read for endpoint routing. |
 
 ## Architecture
 

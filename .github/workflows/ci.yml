@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Deliberately NOT `pip install -e .`: the `compneuro-toolkit>=2.0` pin
+      # is wrong (the local editable install is 0.1.0, and the toolkit is not
+      # on PyPI), so installing the package metadata would fail. The suite
+      # resolves the package via PYTHONPATH=src / conftest.py sys.path insert
+      # instead — same as local runs. ponytail: no version matrix yet; the
+      # floor is 3.11 and nothing in src/ needs newer, add 3.12/3.13 when a
+      # version-specific feature lands.
+      # ruff is PINNED, not floating. The repo has no [tool.ruff] section, so
+      # bare `ruff check` means "whatever the installed version's defaults
+      # are" — and those defaults expand between releases. Observed on
+      # 2026-09-28: local ruff 0.15.12 reports 0 errors; CI's floating 0.16.9
+      # reports 47 (BLE001, RUF100, I001, UP006/035/037, PLW1510, B023...).
+      # That 47 is pre-existing debt on main — identical count at f458c24, and
+      # this branch adds zero — but a floating pin makes CI a moving target
+      # that fails for reasons unrelated to the diff.
+      #
+      # This pins the gate to the version the suite was actually verified
+      # against. It deliberately does NOT fix the 47: that is a separate
+      # decision about which rule set this project wants, and several of those
+      # findings (BLE001, B023) look intentional. Raise a dedicated PR.
+      # Bump this pin deliberately, reviewing the delta first.
+      - run: pip install "ruff==0.15.12" pytest pytest-asyncio openai pydantic numpy scipy
+      - run: ruff check --no-cache
+      - run: PYTHONPATH=src python -m pytest tests/ -q
+
+  go:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.2" # must match tui/go.mod
+      - run: go vet ./...
+      - run: go test ./...
+      - run: go build ./...

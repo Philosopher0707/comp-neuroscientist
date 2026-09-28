@@ -30,7 +30,16 @@ type Model struct {
 	agentRunner *agent.Runner
 	agentActive bool
 	agentStatus string // "ready", "running", "done", "error"
-	runID       int    // incremented each Start() to detect stale AgentDoneMsg
+	// currentRun is the handle for the in-flight agent run, or nil when idle.
+	// Ownership of the event/done channels lives on the run itself, so a
+	// previous run's goroutine can never deliver into this one. The ID is
+	// carried along for a cheap defence-in-depth staleness check on messages.
+	currentRun *agent.Stream
+
+	// startRun launches an agent run. It is a field so tests can substitute a
+	// channel-backed fake instead of spawning a real Python subprocess on
+	// every Enter keypress. Nil means "use agentRunner.Start".
+	startRun func(prompt, modelName string, localMode bool) (*agent.Stream, error)
 
 	// Output
 	streamingOutput string   // accumulated text from current run (Pi-style)
@@ -129,6 +138,15 @@ func NewModel(pythonPath, agentModule string) *Model {
 	}
 }
 
+// launchRun starts an agent run, honouring the startRun override so tests can
+// run without a real Python subprocess.
+func (m *Model) launchRun(prompt string, localMode bool) (*agent.Stream, error) {
+	if m.startRun != nil {
+		return m.startRun(prompt, m.modelName, localMode)
+	}
+	return m.agentRunner.Start(prompt, m.modelName, localMode)
+}
+
 // ── Messages ─────────────────────────────────────────────────
 
 // AgentEventMsg is sent when a new protocol event arrives from the agent.
@@ -158,32 +176,52 @@ func (m Model) Init() tea.Cmd {
 	)
 }
 
-// waitForEvents returns a command that listens for agent events
-// and sends them as tea.Msg on the main loop.
+// waitForEvents returns a command that listens for events on the current run
+// and delivers them as tea.Msg on the main loop.
+//
+// The run handle is captured here, at command-construction time, so the command
+// is permanently bound to the execution it was created for. It reads run.Events
+// / run.Done rather than going back through the Runner, which means a run
+// that has since been superseded cannot have its output delivered here, and this
+// command's channels cannot be closed by a different run's teardown.
 func (m Model) waitForEvents() tea.Cmd {
-	runID := m.runID // capture current run ID — reject if stale
+	run := m.currentRun
+	if run == nil {
+		// Nothing in flight — never block the main loop.
+		return nil
+	}
+	runID := run.ID
 	return func() tea.Msg {
-		// Non-blocking drain: consume any buffered event before waiting.
-		// This prevents data loss when Done() closes simultaneously with
-		// the last buffered events still in the channel.
+		// Non-blocking drain first: consume any event already buffered before
+		// waiting. Without this, a Done signal racing the last buffered events
+		// would drop them.
 		select {
-		case ev, ok := <-m.agentRunner.Events():
+		case ev, ok := <-run.Events:
 			if ok {
 				return AgentEventMsg{RunID: runID, Event: ev}
 			}
-			// Channel closed — agent is done
 			return AgentDoneMsg{RunID: runID}
 		default:
 		}
 
-		// Blocking wait for the next event or done signal
+		// Blocking wait for the next event or the done signal.
 		select {
-		case ev, ok := <-m.agentRunner.Events():
+		case ev, ok := <-run.Events:
 			if !ok {
 				return AgentDoneMsg{RunID: runID}
 			}
 			return AgentEventMsg{RunID: runID, Event: ev}
-		case <-m.agentRunner.Done():
+		case <-run.Done:
+			// Done is closed only after the event channel is closed and fully
+			// drained, so nothing buffered is lost here. Take one more event if
+			// one is already available before declaring the run finished.
+			select {
+			case ev, ok := <-run.Events:
+				if ok {
+					return AgentEventMsg{RunID: runID, Event: ev}
+				}
+			default:
+			}
 			return AgentDoneMsg{RunID: runID}
 		}
 	}
@@ -222,8 +260,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			prompt := m.input.Value()
 			m.input.SetValue("")
 			m.agentStatus = "running"
-			m.agentActive = true
-			m.runID++
+			// agentActive is set only once Start succeeds, so a failed spawn
+			// leaves the input usable instead of wedged in "running".
 			m.startTime = time.Now()
 			m.turnCount = 0
 			m.userScrolledUp = false
@@ -244,8 +282,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.GotoBottom()
 
 			localMode := !strings.Contains(m.modelName, ":cloud")
-			if err := m.agentRunner.Start(prompt, m.modelName, localMode); err != nil {
-				m.agentActive = false // FIX: reset so next Enter works
+			run, err := m.launchRun(prompt, localMode)
+			if err != nil {
+				m.agentActive = false // reset so next Enter works
+				m.currentRun = nil
 				m.agentStatus = "error"
 				m.streamingOutput += fmt.Sprintf("\n❌ Error: %v\n", err)
 				// Refresh viewport so user sees the error
@@ -255,6 +295,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewport.GotoBottom()
 				return m, nil
 			}
+			// Bind the model to this run before registering the listener, so
+			// waitForEvents captures the handle that owns these channels.
+			m.currentRun = run
+			m.agentActive = true
 			// Re-focus input for next prompt
 			m.focus = "input"
 			m.input.Focus()
@@ -281,6 +325,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.agentRunner.Stop()
 				m.agentActive = false
 				m.agentStatus = "ready"
+				// Drop the handle so any in-flight Done from this run is
+				// rejected rather than mutating state after teardown.
+				m.currentRun = nil
 			}
 			m.quitting = true
 			return m, tea.Quit
@@ -289,6 +336,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.agentRunner.Stop()
 				m.agentActive = false
 				m.agentStatus = "ready"
+				// Same reasoning as Quit: discard the stopped run's handle.
+				m.currentRun = nil
 			}
 			return m, nil
 
@@ -317,8 +366,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ── Agent events ────────────────────────────────
 
 	case AgentEventMsg:
-		// Reject events from a previous run (stale goroutine)
-		if msg.RunID != m.runID {
+		// Reject events from a superseded run. Because channels are owned per
+		// run this should be unreachable, but it is cheap and turns a silent
+		// corruption into an obvious, testable invariant violation.
+		if m.currentRun == nil || msg.RunID != m.currentRun.ID {
 			break
 		}
 		ev := msg.Event
@@ -418,8 +469,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case AgentDoneMsg:
-		// Ignore stale DoneMsg from a previous run (only current or newer runIDs are valid)
-		if msg.RunID != 0 && msg.RunID < m.runID {
+		// Ignore a Done signal from a superseded run. The run owns its own done
+		// channel now, so this is a defensive check rather than the mechanism
+		// that makes teardown work.
+		if m.currentRun == nil || msg.RunID != m.currentRun.ID {
 			break
 		}
 		m.agentActive = false
