@@ -4,6 +4,7 @@ Regression witness for the inverted denylist: the old pattern
 `\\brm\\s+-rf\\s*/\\b` placed \\b after '/', a non-word char, so it required a
 word char next — blocking `rm -rf /Users/x` while ALLOWING `rm -rf /`.
 """
+import re
 import sys
 from pathlib import Path
 
@@ -378,8 +379,16 @@ def test_bash_executes_and_returns_stdout():
 
 
 def test_bash_reports_nonzero_exit():
+    # The contract under test is "a nonzero exit is surfaced to the caller",
+    # NOT a specific exit code. Hardcoding 1 was BSD/macOS-specific and broke
+    # on Linux: BSD `ls` exits 1 for a missing operand, GNU coreutils `ls`
+    # exits 2. CI caught this on its first run against Linux. Assert the
+    # invariant (nonzero) and let the platform pick the value, so the test
+    # states what it actually means instead of a macOS coincidence.
     out = _bash("ls /definitely_not_here_zzz")
-    assert out.startswith("[exit 1]"), out
+    m = re.match(r"\[exit (\d+)\]", out)
+    assert m is not None, out
+    assert int(m.group(1)) != 0, out
 
 
 def test_bash_reports_missing_binary():
