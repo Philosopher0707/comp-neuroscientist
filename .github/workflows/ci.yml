@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Deliberately NOT `pip install -e .`: the `compneuro-toolkit>=2.0` pin
+      # is wrong (the local editable install is 0.1.0, and the toolkit is not
+      # on PyPI), so installing the package metadata would fail. The suite
+      # resolves the package via PYTHONPATH=src / conftest.py sys.path insert
+      # instead — same as local runs. ponytail: no version matrix yet; the
+      # floor is 3.11 and nothing in src/ needs newer, add 3.12/3.13 when a
+      # version-specific feature lands.
+      - run: pip install ruff pytest pytest-asyncio openai pydantic numpy scipy
+      - run: ruff check
+      - run: PYTHONPATH=src python -m pytest tests/ -q
+
+  go:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.2" # must match tui/go.mod
+      - run: go vet ./...
+      - run: go test ./...
+      - run: go build ./...

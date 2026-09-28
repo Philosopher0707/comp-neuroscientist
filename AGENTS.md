@@ -119,11 +119,24 @@ The Go TUI reads these lines from the subprocess stdout and updates the UI.
 
 | Field | Env var | Default | Description |
 |---|---|---|---|
-| `model` | `CN_MODEL` | `deepseek-v4-flash:cloud` | Ollama model |
-| `ollama_url` | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server |
+| `model` | `CN_MODEL` | `deepseek-v4-flash:cloud` (or `llama3.1` if `CN_LOCAL`) | Ollama model |
+| `ollama_url` | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server — **the only** endpoint authority |
+| `local` | `CN_LOCAL` | unset (cloud) | `1`/`true`/`yes` forces local-only: loopback endpoint + `llama3.1` default |
 | `max_turns` | `CN_MAX_TURNS` | `30` | Max agent iterations |
 | `effort` | `CN_EFFORT` | `high` | Agent effort level |
 | `output_dir` | `CN_OUTPUT_DIR` | `results` | Output directory |
+| `api_key` (derived) | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | `ollama` in local mode | Credential fallback for non-local mode only; never used for endpoint routing |
+
+`ANTHROPIC_BASE_URL` never routes traffic on the CLI/TUI path — do not set it. The
+endpoint comes from `Config.ollama_url` (env `OLLAMA_BASE_URL`, default
+`http://localhost:11434`), normalized by `config.resolved_base_url` and passed to
+the SDK as `ClaudeAgentOptions.base_url`. Because both the CLI and the TUI always
+pass that value explicitly, the SDK's `if options.base_url:` branch always wins and
+ambient env cannot reroute the call. (The SDK still keeps a legacy
+`env_fallback=True` branch that reads `ANTHROPIC_BASE_URL` for third-party callers
+who have not threaded a value through; that branch is unreachable from this repo's
+own entry points.) That single-authority chain is what makes `CN_LOCAL`
+un-defeatable by ambient environment variables.
 
 ## TUI Details
 
