@@ -213,8 +213,37 @@ _MAX_OUTPUT = 8192          # chars
 # Shell metacharacters that enable chaining and substitution.
 # `&`, `|`, `;`, backtick and `$(` all start a SECOND command; one Bash call
 # is one command. Redirection (>, <) is permitted — the agent legitimately
-# writes files that way — but the redirect TARGET is containment-checked below.
+# writes files that way — but the redirect TARGET is judged by the same
+# boundary as a command target: writing must not be a way around it.
 _SHELL_CHAIN_CHARS = ("&", "|", ";", "`", "$", "\n")
+
+# Commands whose LAST non-option argument is where the file lands, so the
+# boundary must be checked there. Without these, the boundary only guarded
+# deletion and an attacker wrote anywhere with `cp src /etc/launchd/evil.plist`.
+# `tee` writes each of its file operands, so it belongs here: the bare form
+# `tee /etc/hosts` is the same write as `> /etc/hosts` with no redirect present.
+# (The piped form is separately unreachable — `|` is rejected outright.)
+_WRITE_TARGET_CMDS = frozenset({
+    "cp", "mv", "install", "rsync", "tee",
+})
+
+# Commands allowed to write outside the workspace when the destination is not
+# a protected target. `cp a /tmp/b`, `tee out.log` and the pinned
+# `cat /etc/passwd > /tmp/x` are ordinary scratch use; `install`/`rsync`/`ln`
+# are not, because they exist to place files in system locations.
+_UNCONSTRAINED_WRITE_CMDS = ("cp", "mv", "tee")
+
+# `ln -s` takes SOURCE first then destination, so its target is the LAST
+# non-option argument too, but it needs the flag that carries the path.
+_SYMLINK_CMDS = frozenset({"ln"})
+
+# A redirect target that is already inside the workspace, or is a fresh file
+# in a scratch dir, is legitimate. What is never legitimate is overwriting or
+# reading a PROTECTED target (see _SYSTEM_TARGETS), or resolving outside into
+# a place the agent has no business writing. The boundary for a redirect is
+# therefore "not a protected target", not "inside the workspace" — /tmp/x is
+# pinned as legitimate by tests, and /etc/hosts is not.
+_REDIRECT_BARE = re.compile(r"(?<![0-9<>])>{1,2}(?![>0-9])")
 
 # Commands that can destroy data or alter system state. Each target argument
 # is checked against the workspace boundary rather than pattern-matched.
@@ -239,10 +268,28 @@ _INLINE_DESTRUCTION = [
     r"\brmtree\b",
     r"\bunlink\b",
     r"\bsend2trash\b",
+    # `from os import remove; remove(...)` and `import os as o; o.remove(...)`
+    # defeat a pattern that requires the `os.` prefix, so a BARE call of a
+    # destructive builtin is treated as destruction too.
+    r"(?<![\w.])remove\s*\(",
+    r"(?<![\w.])removedirs\s*\(",
+    r"(?<![\w.])rmdir\s*\(",
+    # `import os as o; o.remove('/etc/hosts')` — the receiver is an alias, so
+    # a pattern keyed on `os.` misses it. Require a path-shaped string so an
+    # ordinary `mylist.remove('x')` is not caught by accident.
+    r"\.\s*remove\s*\(\s*['\"]/",
+    r"\.\s*remove\s*\(\s*f['\"]",
     r"\bos\s*\.\s*remove\s*\(",
     r"\bos\s*\.\s*rmdir\s*\(",
     r"\bos\s*\.\s*removedirs\s*\(",
     r"\bsystem\s*\(\s*['\"]\s*rm\b",
+    r"\bos\s*\.\s*system\s*\(",
+    r"\bsubprocess\s*\.\s*(run|call|check_output|check_call|Popen)\s*\(",
+    r"\bsubprocess\s*\.\s*getoutput\s*\(",
+    r"\bcheck_output\s*\(\s*['\"]\s*rm\b",
+    r"\bshutil\s*\.\s*(move|rmtree)\s*\(",
+    r"\bwrite_text\s*\(.*rm\s+-rf",
+    r"\bsystem\s*\(\s*['\"]\s*rm\s+-rf",
     r"\bpopen\s*\(",
     r"\btruncate\s*\(\s*['\"]?/",
     r"\bopen\s*\(\s*['\"]/[^'\"]*['\"]\s*,\s*['\"]w",
@@ -275,6 +322,9 @@ _DENIED_CMDS = frozenset({"xargs"})
 _SCRIPTED_DESTRUCTION = [
     r"\brm_rf\b", r"\brm_r\b", r"\brmSync\b", r"\brmdirSync\b",
     r"\bunlink\b", r"\bFileUtils\b", r"\bDir\s*\.\s*rm\b",
+    r"\bFile\s*\.\s*delete\b", r"\bFileUtils\s*\.\s*rm_rf\b",
+    r"\bunlinkSync\b", r"\btruncateSync\b", r"\brmdirSync\b",
+    r"\bFile\s*\.\s*unlink\b", r"\bFileUtils\s*\.\s*rm\b",
 ]
 
 # Command-line patterns that have no legitimate use here and are always denied.
@@ -305,6 +355,99 @@ def _safe_resolve(path_str: str) -> Path:
     p = p.resolve()
     # No traversal above cwd is enforced by resolve()
     return p
+
+
+def _interpreter_code(parts: list[str]) -> str | None:
+    """Return the inline-code payload of an interpreter invocation.
+
+    POSIX says option arguments cluster: `sh -ec '...'`, `sh -e -c '...'` and
+    `sh --command '...'` all take the code from the argument AFTER the flag
+    that carries it, wherever that flag appears in the cluster. Matching
+    `parts[1] == "-c"` only caught the single-flag spelling and let every
+    other spelling past the recursion entirely.
+    """
+    # Only `-c` and `--command` take the code as their own value. `-e` is a
+    # BOOLEAN flag (errexit): it takes no argument, so `sh -e -c 'code'` must
+    # keep scanning the cluster instead of swallowing `-c` as the payload.
+    value_flags = {"-c", "--command"}
+    # Short clusters are scanned char by char: any `c` means the next argument
+    # is the code (`-ec`, `-xc`, `-lc`).
+    i = 1
+    while i < len(parts):
+        tok = parts[i]
+        if not tok.startswith("-"):
+            return None
+        if tok in value_flags:
+            return parts[i + 1] if i + 1 < len(parts) else None
+        if tok.startswith("--"):
+            # A long option we do not know may take a value, so stop rather
+            # than guess and treat the next token as code.
+            return None
+        if "c" in tok[1:]:
+            return parts[i + 1] if i + 1 < len(parts) else None
+        i += 1
+    return None
+
+
+def _redirect_targets(command: str) -> list[tuple[str, bool]]:
+    """Return (path, is_write) for every file a redirection would touch.
+
+    Only the OUTSIDE-quotes text is scanned, so a `>` inside a quoted string
+    (e.g. the `-c` payload of an interpreter) is not mistaken for a redirect.
+    """
+    bare = re.sub(r"'[^']*'|\"[^\"]*\"", lambda m: " " * len(m.group(0)), command)
+    targets: list[tuple[str, bool]] = []
+    # `\d*` so a file-descriptor prefix is consumed: `2> /etc/hosts` writes to
+    # a real file and must be judged, not skipped as a comparison.
+    for m in re.finditer(r"(?<![<>])\d*>{1,2}(?![>0-9])\s*([^\s;|&<>]+)", bare):
+        targets.append((m.group(1), True))
+    # `<` reads a file; it cannot write, so the write-only home-directory
+    # rules deliberately do not apply to it.
+    for m in re.finditer(r"<([^<>&|;\s]+)", bare):
+        targets.append((m.group(1), False))
+    return targets
+
+
+# Write-side targets inside the home directory that are persistence or
+# credential mechanisms. _SYSTEM_TARGETS deliberately omits home directories
+# (the workspace usually lives in one), but that omission must not make
+# `> ~/.ssh/authorized_keys` or `> ~/.zshrc` a way to install persistence.
+# Checked only for WRITES; reading from home is not restricted by this policy —
+# and that is deliberate, because `cat ~/.ssh/id_rsa` is already permitted, so
+# refusing `cp ~/.ssh/id_rsa .` would deny a copy of content the agent can
+# simply print. Copying secrets out is a boundary problem, not a denylist one.
+_PROTECTED_HOME_TARGETS = (
+    "~/.ssh", "~/.aws", "~/.gnupg", "~/.kube", "~/.docker", "~/.config/gh",
+    "~/.git-credentials", "~/.netrc", "~/.pgpass", "~/.npmrc", "~/.env",
+    "~/.zshrc", "~/.zshenv", "~/.zprofile", "~/.bashrc", "~/.bash_profile",
+    "~/.profile", "~/.gitconfig",
+    # Autostart / login-item persistence. macOS per-user launchd agents, the
+    # legacy StartupItems folder, and the Linux equivalents. Without these,
+    # `> ~/Library/LaunchAgents/evil.plist` was a free persistence install.
+    "~/Library/LaunchAgents", "~/Library/LaunchDaemons", "~/Library/StartupItems",
+    "~/Library/Keychains", "~/Library/Preferences/com.apple.loginitems.plist",
+    "~/.config/autostart.desktop", "~/.config/autostart.d", "~/.config/systemd/user",
+    "~/.config/update-motd.d", "~/.vim/autoload", "~/.vim/plugins", "~/.emacs.d",
+)
+
+
+def _is_protected_target(resolved: Path, *, write: bool = False) -> str | None:
+    """Return the protected path if `resolved` is one, else None.
+
+    `write=True` additionally protects persistence/credential files inside the
+    home directory. Reading those is legitimate here (`cat ~/.gitconfig`),
+    so the extra rule must not apply to a read target.
+    """
+    for prot in _SYSTEM_TARGETS:
+        if resolved == Path(prot) or Path(prot) in resolved.parents:
+            return prot
+    if not write:
+        return None
+    for pat in _PROTECTED_HOME_TARGETS:
+        base = Path(pat).expanduser()
+        if resolved == base or base in resolved.parents:
+            return str(base)
+    return None
 
 
 def _is_inside_workspace(target: Path) -> bool:
@@ -391,12 +534,26 @@ def _deny_reason(command: str) -> str | None:
 
     # 0b. `sh -c '<command>'` runs its quoted argument as a shell command, so
     #     judge that payload with this same policy rather than regex-scanning it.
-    if head in _SHELL_INTERPRETERS and len(parts) >= 3 and parts[1] in ("-c",):
-        payload = parts[2]
-        if payload and payload != command:
+    #     The flag is found by scanning the option cluster, so `sh -ec '...'`
+    #     and `sh -e -c '...'` recurse exactly like `sh -c '...'`.
+    if head in _SHELL_INTERPRETERS:
+        payload = _interpreter_code(parts)
+        if payload:
             nested = _deny_reason(payload)
             if nested is not None:
                 return f"Inner command denied — {nested}"
+
+    # 0d. Redirection targets. `> /etc/hosts` is the write-side twin of
+    #     `rm /etc/hosts`, and the comment above claims this check exists.
+    for target, is_write in _redirect_targets(command):
+        try:
+            resolved = Path(target).expanduser().resolve()
+        except (OSError, RuntimeError):
+            continue
+        prot = _is_protected_target(resolved, write=is_write)
+        if prot is not None:
+            verb = "redirect into" if is_write else "redirect from"
+            return f"Refusing to {verb} protected target {resolved}."
 
     # 3a. inline interpreter code
     if head in _INTERPRETERS:
@@ -432,6 +589,42 @@ def _deny_reason(command: str) -> str | None:
                         f"Refusing to run {head!r} against protected "
                         f"target {resolved}."
                     )
+
+    # 3d. creation/copy/move targets. Deletion is checked above; without this
+    #     the boundary was one-sided and `cp x /etc/launchd/evil.plist` wrote
+    #     outside the workspace freely. The target of a copy is the LAST
+    #     non-option argument, so `cp -r a b` is judged on `b`.
+    if head in _WRITE_TARGET_CMDS or head in _SYMLINK_CMDS:
+        operands = [a for a in parts[1:] if not a.startswith("-")]
+        if operands:
+            # `tee` is the one command here that writes EVERY file operand, so
+            # `tee /etc/hosts out.log` must be judged on all of them. Every
+            # other command lands its write on the last one.
+            destinations = operands if head == "tee" else operands[-1:]
+            for op in destinations:
+                dest = Path(op).expanduser().resolve()
+                prot = _is_protected_target(dest, write=True)
+                if prot is not None:
+                    return (
+                        f"Refusing to run {head!r} into protected target {dest}."
+                    )
+                if (not _is_inside_workspace(dest)
+                        and head not in _UNCONSTRAINED_WRITE_CMDS):
+                    return (
+                        f"Refusing to run {head!r} into {dest}: "
+                        "outside the working directory."
+                    )
+            # `mv` also WRITES to its source: the original path stops existing.
+            # Judging only the destination left `mv ~/Library/Keychains ./k`
+            # free, which moves the user's keychain out from under the system.
+            if head == "mv":
+                for src in operands[:-1]:
+                    sp = Path(src).expanduser().resolve()
+                    if _is_protected_target(sp, write=True) is not None:
+                        return (
+                            f"Refusing to run 'mv' out of protected target "
+                            f"{sp}: moving it would remove the original."
+                        )
 
     # 3c. build systems that delete on request. `make` itself is fine, so only
     # the deleting targets are denied — blocking all of `make` would break
